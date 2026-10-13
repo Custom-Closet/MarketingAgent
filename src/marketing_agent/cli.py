@@ -1,0 +1,386 @@
+"""Command-line interface: `agent --help`."""
+
+from __future__ import annotations
+
+import csv
+import os
+from contextlib import ExitStack
+import shutil
+import subprocess
+import webbrowser
+from pathlib import Path
+from typing import Optional
+
+import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+from . import clients, pipeline
+from .config import Settings, load_settings
+from .db import Database
+from .storage import LockBusy, open_database
+
+app = typer.Typer(help="Lead discovery and approved-outreach agent for Gmail and Instagram.", no_args_is_help=True)
+find_app = typer.Typer(help="Discover new leads.", no_args_is_help=True)
+targets_app = typer.Typer(help="Queue discovery targets for the daily run.", no_args_is_help=True)
+app.add_typer(find_app, name="find")
+app.add_typer(targets_app, name="targets")
+console = Console()
+
+# Resources (the database) opened by a command; closed - and uploaded to S3 - when the command ends.
+_resources = ExitStack()
+
+
+@app.callback()
+def _main(ctx: typer.Context) -> None:
+    ctx.call_on_close(_resources.close)
+
+BRAND_TEMPLATE = """\
+# Brand profile
+
+Claude reads this file to write every message. Be specific - vague input gives generic output.
+
+## Who we are
+<Brand name, what you sell, price range, what makes you different.>
+
+## Ideal customer
+<Who you're reaching out to: e.g. boutique owners, fitness creators with 10k-100k followers,
+DTC founders. What problem do you solve for them?>
+
+## Offer / call to action
+<What you want them to do: reply for a wholesale catalog, try a free sample, book a 15-min call.>
+
+## Voice
+<e.g. warm, concise, a little playful. Words/phrases to avoid.>
+
+## Proof points
+<Customers, press, numbers you're allowed to mention.>
+"""
+
+
+def _ctx() -> tuple[Settings, Database]:
+    """Settings plus the database, opened for this command and saved (to S3 if configured) when it exits."""
+    settings = load_settings()
+    try:
+        db = _resources.enter_context(open_database(settings))
+    except LockBusy as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    return settings, db
+
+
+def _log(message: str) -> None:
+    console.print(message, highlight=False)
+
+
+def _require(client, what: str):
+    if client is None:
+        raise typer.BadParameter(f"{what} is not configured - see .env.example")
+    return client
+
+
+def _hunter(settings: Settings):
+    return _require(clients.hunter_client(settings), "HUNTER_API_KEY")
+
+
+def _instagram(settings: Settings):
+    return _require(clients.instagram_client(settings), "IG_ACCESS_TOKEN / IG_USER_ID")
+
+
+def _gmail(settings: Settings):
+    return clients.gmail_client(settings, interactive=True)
+
+
+def _writer(settings: Settings):
+    return clients.writer(settings)
+
+
+# ---- setup ---------------------------------------------------------------
+
+@app.command()
+def init() -> None:
+    """Create the database and a brand.md template."""
+    settings, _ = _ctx()
+    if not settings.brand_file.exists():
+        settings.brand_file.write_text(BRAND_TEMPLATE)
+        _log(f"Created {settings.brand_file} - fill it in before drafting.")
+    if not Path(".env").exists() and Path(".env.example").exists():
+        shutil.copy(".env.example", ".env")
+        _log("Created .env from .env.example - add your API keys.")
+    _log(f"Database ready at {settings.db_path}")
+
+
+@app.command("auth-gmail")
+def auth_gmail() -> None:
+    """Authorize Gmail access in the browser (one time)."""
+    settings = load_settings()
+    _gmail(settings)
+    _log(f"Gmail authorized. Token saved to {settings.gmail_token_file}")
+
+
+@app.command("push-secrets")
+def push_secrets(secret_id: str = typer.Option("marketing-agent/secrets", help="Secrets Manager secret name")) -> None:
+    """Upload API keys from .env and the Gmail token to AWS Secrets Manager for the Lambda run."""
+    import json
+
+    import boto3
+
+    from .lambda_handler import SECRET_KEYS
+
+    settings = load_settings()
+    if not settings.gmail_token_file.exists():
+        raise typer.BadParameter("Run `agent auth-gmail` first")
+    values = {"ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", ""),
+              "HUNTER_API_KEY": settings.hunter_api_key,
+              "IG_ACCESS_TOKEN": settings.ig_access_token,
+              "GMAIL_TOKEN_JSON": settings.gmail_token_file.read_text()}
+    values = {k: v for k, v in values.items() if k in SECRET_KEYS and v}
+    boto3.client("secretsmanager").put_secret_value(SecretId=secret_id, SecretString=json.dumps(values))
+    _log(f"Stored {', '.join(sorted(values))} in {secret_id}.")
+
+
+# ---- discovery -----------------------------------------------------------
+
+@find_app.command("domain")
+def find_domain(
+    domains: list[str] = typer.Argument(..., help="Company domains, e.g. acme.com"),
+    limit: int = typer.Option(10, help="Max contacts per domain"),
+    seniority: Optional[str] = typer.Option(None, help="junior, senior or executive"),
+    department: Optional[str] = typer.Option(None, help="e.g. marketing, sales, executive"),
+    verify: bool = typer.Option(True, help="Verify each email with Hunter (uses verification credits)"),
+) -> None:
+    """Find people and emails at company domains via Hunter.io."""
+    settings, db = _ctx()
+    hunter = _hunter(settings)
+    total = 0
+    for domain in domains:
+        _log(f"[bold]{domain}[/bold]")
+        total += pipeline.discover_domain(db, hunter, domain, limit=limit, seniority=seniority,
+                                          department=department, verify=verify, log=_log)
+    _log(f"{total} leads saved.")
+
+
+@find_app.command("instagram")
+def find_instagram(
+    user: list[str] = typer.Option([], "--user", "-u", help="Instagram username (repeatable)"),
+    hashtag: list[str] = typer.Option([], "--hashtag", "-t", help="Hashtag to mine for @mentions (repeatable)"),
+    file: Optional[Path] = typer.Option(None, help="Text file with one username per line"),
+    min_followers: int = typer.Option(0, help="Skip accounts below this follower count"),
+) -> None:
+    """Enrich Instagram business/creator accounts into leads."""
+    settings, db = _ctx()
+    ig = _instagram(settings)
+    usernames = {u.lower().lstrip("@") for u in user}
+    if file:
+        usernames |= {line.strip().lower().lstrip("@") for line in file.read_text().splitlines() if line.strip()}
+    for tag in hashtag:
+        mentions = ig.hashtag_mentions(tag)
+        _log(f"#{tag}: {len(mentions)} accounts mentioned")
+        usernames |= mentions
+    if not usernames:
+        raise typer.BadParameter("Pass --user, --hashtag or --file")
+    added = pipeline.discover_instagram(db, ig, usernames, min_followers=min_followers, log=_log)
+    _log(f"{added} Instagram leads saved. Run `agent enrich` to find emails for their websites.")
+
+
+@find_app.command("csv")
+def find_csv(path: Path) -> None:
+    """Import leads from a CSV with any of: name,email,company,domain,position,ig_username,website,notes."""
+    _, db = _ctx()
+    with path.open(newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    for row in rows:
+        fields = {k.strip().lower(): (v or "").strip() for k, v in row.items() if k}
+        fields["source"] = "csv"
+        db.upsert_lead(**fields)
+    _log(f"Imported {len(rows)} rows.")
+
+
+@targets_app.command("add")
+def targets_add(
+    kind: str = typer.Argument(..., help="domain, instagram or hashtag"),
+    values: list[str] = typer.Argument(..., help="e.g. acme.com / cafeluna / specialtycoffee"),
+) -> None:
+    """Queue targets; the daily run discovers leads from them (DAILY_DISCOVERY_LIMIT per day)."""
+    kinds = {"domain": "domain", "instagram": "ig_user", "hashtag": "hashtag"}
+    if kind not in kinds:
+        raise typer.BadParameter("kind must be domain, instagram or hashtag")
+    _, db = _ctx()
+    added = sum(db.add_target(kinds[kind], v) for v in values)
+    _log(f"Queued {added} new {kind} targets ({len(values) - added} already queued).")
+
+
+@targets_app.command("list")
+def targets_list() -> None:
+    """Show the most recent targets and their results."""
+    _, db = _ctx()
+    table = Table("Kind", "Value", "Status", "Result")
+    for t in db.targets():
+        table.add_row(t["kind"], t["value"], t["status"], t["result"] or "")
+    console.print(table)
+
+
+@app.command()
+def enrich(verify: bool = typer.Option(True, help="Verify found emails with Hunter")) -> None:
+    """Use Hunter.io to find emails for leads that only have a website/domain."""
+    settings, db = _ctx()
+    found = pipeline.enrich_emails(db, _hunter(settings), verify=verify, log=_log)
+    _log(f"Found {found} emails.")
+
+
+# ---- drafting & review ---------------------------------------------------
+
+@app.command()
+def draft(
+    channel: str = typer.Option("email", help="email or instagram"),
+    limit: int = typer.Option(20, help="Max new drafts"),
+    followups: bool = typer.Option(False, help="Also draft follow-ups for unanswered emails"),
+) -> None:
+    """Have Claude write personalized drafts. Drafts wait for `agent review`."""
+    if channel not in ("email", "instagram"):
+        raise typer.BadParameter("channel must be email or instagram")
+    settings, db = _ctx()
+    writer = _writer(settings)
+    n = pipeline.draft_initial(db, writer, channel, limit=limit, log=_log)
+    if followups and channel == "email":
+        n += pipeline.draft_followups(db, writer, settings, log=_log)
+    _log(f"{n} drafts created. Next: `agent review`")
+
+
+@app.command()
+def review(channel: Optional[str] = typer.Option(None, help="email or instagram")) -> None:
+    """Approve, edit or reject pending drafts one by one."""
+    _, db = _ctx()
+    queue = db.messages(status="pending", channel=channel)
+    if not queue:
+        _log("No pending drafts.")
+        return
+    approved = 0
+    for i, row in enumerate(queue, 1):
+        to = row["email"] if row["channel"] == "email" else f"@{row['ig_username']}"
+        title = f"[{i}/{len(queue)}] {row['channel']} {row['kind']} -> {to}"
+        if row["company"]:
+            title += f"  ({row['company']})"
+        body = f"[bold]{row['subject']}[/bold]\n\n{row['body']}" if row["subject"] else row["body"]
+        console.print(Panel(body, title=title, title_align="left"))
+        choice = typer.prompt("[a]pprove  [e]dit  [r]eject  [s]kip  [q]uit", default="s").lower()[:1]
+        if choice == "q":
+            break
+        if choice == "e":
+            text = f"{row['subject']}\n---\n{row['body']}" if row["subject"] else row["body"]
+            edited = typer.edit(text)
+            if edited:
+                if row["subject"] and "\n---\n" in edited:
+                    subject, new_body = edited.split("\n---\n", 1)
+                    db.update_message(row["id"], subject=subject.strip(), body=new_body.strip())
+                else:
+                    db.update_message(row["id"], body=edited.strip())
+            choice = "a"
+        if choice == "a":
+            db.update_message(row["id"], status="approved")
+            approved += 1
+        elif choice == "r":
+            db.update_message(row["id"], status="rejected")
+    _log(f"{approved} approved. Next: `agent send` (email) or `agent ig-queue` (Instagram).")
+
+
+# ---- sending -------------------------------------------------------------
+
+@app.command()
+def send(dry_run: bool = typer.Option(False, help="Show what would be sent without sending")) -> None:
+    """Send approved emails via Gmail, within the daily cap, spaced out over time."""
+    settings, db = _ctx()
+    gmail = None if dry_run else _gmail(settings)
+    n = pipeline.send_approved_emails(db, gmail, settings, dry_run=dry_run, log=_log)
+    _log(f"{n} emails sent.")
+
+
+@app.command("ig-queue")
+def ig_queue() -> None:
+    """Assisted Instagram DMs: copies each approved message and opens the profile for you to send."""
+    _, db = _ctx()
+    queue = [m for m in db.messages(status="approved", channel="instagram") if m["kind"] == "initial"]
+    if not queue:
+        _log("No approved Instagram DMs.")
+        return
+    has_pbcopy = shutil.which("pbcopy") is not None
+    for i, row in enumerate(queue, 1):
+        console.print(Panel(row["body"], title=f"[{i}/{len(queue)}] @{row['ig_username']}", title_align="left"))
+        if has_pbcopy:
+            subprocess.run(["pbcopy"], input=row["body"].encode(), check=False)
+            _log("Copied to clipboard.")
+        webbrowser.open(f"https://ig.me/m/{row['ig_username']}")
+        choice = typer.prompt("Sent? [y]es  [n]o/skip  [r]eject  [q]uit", default="y").lower()[:1]
+        if choice == "q":
+            break
+        if choice == "y":
+            db.mark_sent(row["id"])
+        elif choice == "r":
+            db.update_message(row["id"], status="rejected")
+
+
+@app.command("ig-inbox")
+def ig_inbox(send_approved: bool = typer.Option(False, "--send", help="Send approved replies")) -> None:
+    """Draft replies to inbound DMs (24h window), or send the approved ones with --send."""
+    settings, db = _ctx()
+    ig = _instagram(settings)
+    if send_approved:
+        n = pipeline.send_ig_replies(db, ig, log=_log)
+        _log(f"{n} replies sent.")
+    else:
+        n = pipeline.sync_instagram(db, ig, _writer(settings), log=_log)
+        _log(f"{n} replies drafted. Review with `agent review --channel instagram`, then `agent ig-inbox --send`.")
+
+
+# ---- tracking ------------------------------------------------------------
+
+@app.command()
+def sync() -> None:
+    """Check Gmail threads for replies, bounces and unsubscribes."""
+    settings, db = _ctx()
+    stats = pipeline.sync_gmail(db, _gmail(settings), log=_log)
+    _log(", ".join(f"{v} {k}" for k, v in stats.items()))
+
+
+@app.command()
+def daily() -> None:
+    """Run the daily job locally (the same steps Lambda runs each morning)."""
+    import time
+
+    from . import daily as daily_job
+
+    settings, db = _ctx()
+    report = daily_job.run(settings, db, deadline=time.monotonic() + 30 * 60,
+                           **clients.build_clients(settings, interactive=True))
+    if report.errors:
+        raise typer.Exit(1)
+
+
+@app.command()
+def status() -> None:
+    """Show pipeline counts."""
+    _, db = _ctx()
+    counts = db.counts()
+    table = Table("Group", "Status", "Count")
+    for group, by_status in counts.items():
+        for state, n in sorted(by_status.items()):
+            table.add_row(group, state, str(n))
+    console.print(table)
+    settings = load_settings()
+    if settings.db_s3_uri:
+        _log(f"Database: {settings.db_s3_uri}")
+    _log(f"Email quota left (rolling 24h): {pipeline.remaining_daily_quota(db, settings.daily_email_cap)}"
+         f"/{settings.daily_email_cap}")
+
+
+@app.command()
+def unsubscribe(contact: str = typer.Argument(..., help="Email address or Instagram username")) -> None:
+    """Permanently stop contacting someone."""
+    _, db = _ctx()
+    db.suppress(contact, "manual")
+    _log(f"{contact} added to the suppression list.")
+
+
+if __name__ == "__main__":
+    app()
