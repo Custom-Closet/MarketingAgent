@@ -7,7 +7,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from typing import Any, Callable
 
 from .channels.gmail import GmailChannel, build_email
 from .config import Settings
@@ -224,11 +224,39 @@ def send_approved_emails(db: Database, gmail: GmailChannel, settings: Settings, 
     return sent
 
 
-def send_ig_replies(db: Database, ig: InstagramClient, *, log: Log = print) -> int:
-    """Send approved replies to inbound DMs (allowed by Meta within the 24h window)."""
+IG_MAX_MESSAGE_CHARS = 1000
+
+
+def ig_send_blocker(db: Database, row) -> tuple[str, str] | None:
+    """Gates an approved Instagram reply must pass before sending; returns (status, reason) if blocked."""
+    if not row["approved_at"]:
+        return "pending", "approval was not recorded - review it again"
+    if not row["reply_deadline"] or datetime.fromisoformat(row["reply_deadline"]) <= datetime.now(timezone.utc):
+        return "expired", "reply window closed"
+    if db.is_suppressed([row["ig_username"]]):
+        return "rejected", "recipient is on the suppression list"
+    if db.replied_since(row["lead_id"], row["created_at"]):
+        return "rejected", "another reply was already sent for this message"
+    if not row["body"].strip() or len(row["body"]) > IG_MAX_MESSAGE_CHARS:
+        return "failed", f"message must be 1-{IG_MAX_MESSAGE_CHARS} characters"
+    return None
+
+
+def send_ig_replies(db: Database, ig: InstagramClient, *, confirm: Callable[[Any, float], bool],
+                    log: Log = print) -> int:
+    """Send approved replies to inbound DMs, after the send-time gates and a per-message confirmation."""
     sent = 0
     for row in db.messages(status="approved", channel="instagram"):
         if row["kind"] != "reply":
+            continue
+        if blocked := ig_send_blocker(db, row):
+            status, reason = blocked
+            db.update_message(row["id"], status=status, error=reason)
+            log(f"  not sent to @{row['ig_username']}: {reason}")
+            continue
+        hours_left = (datetime.fromisoformat(row["reply_deadline"]) - datetime.now(timezone.utc)).total_seconds() / 3600
+        if not confirm(row, hours_left):
+            log(f"  skipped @{row['ig_username']} (left approved)")
             continue
         try:
             ig.send_reply(row["thread_id"], row["body"])
@@ -296,7 +324,8 @@ def sync_instagram(db: Database, ig: InstagramClient, writer: Personalizer, *, l
         if already:
             continue
         reply = writer.draft_dm_reply(convo.username, convo.last_inbound_text)
-        db.add_message(lead_id, "instagram", reply.message, kind="reply", thread_id=convo.recipient_id)
+        db.add_message(lead_id, "instagram", reply.message, kind="reply", thread_id=convo.recipient_id,
+                       reply_deadline=(convo.last_inbound_at + REPLY_WINDOW).isoformat(timespec="seconds"))
         hours_left = (REPLY_WINDOW - (datetime.now(timezone.utc) - convo.last_inbound_at)).total_seconds() / 3600
         log(f"  @{convo.username}: \"{convo.last_inbound_text[:60]}\" -> reply drafted ({hours_left:.0f}h left)")
         drafted += 1

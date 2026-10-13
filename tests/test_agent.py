@@ -276,3 +276,68 @@ def test_ig_retries_transient_meta_errors():
     responses = [httpx.Response(500, json={"error": {"message": "Timeout", "code": -2}}),
                  httpx.Response(200, json={"message_id": "m1"})]
     assert _ig(lambda request: responses.pop(0)).send_reply("42", "hi") == "m1"
+
+
+# ---- Instagram send-time approval gates -----------------------------------
+
+class FakeIG:
+    def __init__(self):
+        self.sent = []
+
+    def send_reply(self, recipient_id, text):
+        self.sent.append((recipient_id, text))
+        return "m1"
+
+
+def _ig_reply(db, *, username="fan", hours_left=5.0, approve=True, body="Thanks for writing!"):
+    lead = db.upsert_lead(ig_username=username, source="instagram")
+    deadline = (datetime.now(timezone.utc) + timedelta(hours=hours_left)).isoformat(timespec="seconds")
+    mid = db.add_message(lead, "instagram", body, kind="reply", thread_id="42", reply_deadline=deadline)
+    if approve:
+        db.approve_message(mid)
+    return mid
+
+
+def _status(db, mid):
+    return db.conn.execute("SELECT status, error FROM messages WHERE id = ?", (mid,)).fetchone()
+
+
+def test_ig_send_requires_final_confirmation(db):
+    ok, skipped = _ig_reply(db, username="yes"), _ig_reply(db, username="no")
+    ig = FakeIG()
+    n = pipeline.send_ig_replies(db, ig, confirm=lambda row, hours: row["ig_username"] == "yes", log=lambda m: None)
+    assert n == 1 and ig.sent == [("42", "Thanks for writing!")]
+    assert _status(db, ok)["status"] == "sent" and _status(db, skipped)["status"] == "approved"
+
+
+def test_ig_send_gates_block_before_asking(db):
+    expired = _ig_reply(db, username="late", hours_left=-1)
+    suppressed = _ig_reply(db, username="optout")
+    db.suppress("optout", "manual")
+    too_long = _ig_reply(db, username="wordy", body="x" * 1001)
+    unrecorded = _ig_reply(db, username="legacy", approve=False)
+    db.update_message(unrecorded, status="approved")  # approved without approved_at, e.g. an old row
+    asked, ig = [], FakeIG()
+    pipeline.send_ig_replies(db, ig, confirm=lambda row, hours: asked.append(row) or True, log=lambda m: None)
+    assert ig.sent == [] and asked == []
+    assert [_status(db, m)["status"] for m in (expired, suppressed, too_long, unrecorded)] == \
+        ["expired", "rejected", "failed", "pending"]
+
+
+def test_ig_send_skips_duplicate_reply(db):
+    first, second = _ig_reply(db), _ig_reply(db)
+    ig = FakeIG()
+    pipeline.send_ig_replies(db, ig, confirm=lambda row, hours: True, log=lambda m: None)
+    assert len(ig.sent) == 1 and _status(db, second)["status"] == "rejected"
+
+
+def test_db_migration_adds_gate_columns(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, lead_id INTEGER, channel TEXT, kind TEXT, step INTEGER,"
+                " subject TEXT, body TEXT, status TEXT, thread_id TEXT, rfc_message_id TEXT, error TEXT,"
+                " created_at TEXT, sent_at TEXT)")
+    old.commit(); old.close()
+    cols = {r["name"] for r in Database(path).conn.execute("PRAGMA table_info(messages)")}
+    assert {"approved_at", "reply_deadline"} <= cols

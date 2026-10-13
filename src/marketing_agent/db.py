@@ -3,7 +3,7 @@
 Lifecycle of a message row:
 
     pending  -> approved -> sent
-             -> rejected
+             -> rejected        approved -> expired / failed  (Instagram send-time gates)
     (sent emails are later marked replied / bounced by `sync`)
 """
 
@@ -41,11 +41,13 @@ CREATE TABLE IF NOT EXISTS messages (
     step            INTEGER NOT NULL DEFAULT 0,
     subject         TEXT,
     body            TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'pending',  -- pending / approved / rejected / sent / failed
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending / approved / rejected / sent / failed / expired
     thread_id       TEXT,              -- Gmail thread, or IG conversation recipient id
     rfc_message_id  TEXT,              -- Gmail Message-ID header, used to thread follow-ups
     error           TEXT,
     created_at      TEXT NOT NULL,
+    approved_at     TEXT,
+    reply_deadline  TEXT,              -- IG replies: last send time Meta allows (inbound + reply window)
     sent_at         TEXT
 );
 
@@ -86,6 +88,15 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created."""
+        have = {row["name"] for row in self.conn.execute("PRAGMA table_info(messages)")}
+        for column in ("approved_at", "reply_deadline"):
+            if column not in have:
+                self.conn.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
+        self.conn.commit()
 
     # ---- leads -----------------------------------------------------------
 
@@ -169,12 +180,12 @@ class Database:
 
     def add_message(self, lead_id: int, channel: str, body: str, *, kind: str = "initial",
                     step: int = 0, subject: str | None = None, thread_id: str | None = None,
-                    rfc_message_id: str | None = None) -> int:
+                    rfc_message_id: str | None = None, reply_deadline: str | None = None) -> int:
         cur = self.conn.execute(
             """INSERT INTO messages (lead_id, channel, kind, step, subject, body, thread_id,
-                                     rfc_message_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (lead_id, channel, kind, step, subject, body, thread_id, rfc_message_id, now_iso()),
+                                     rfc_message_id, reply_deadline, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (lead_id, channel, kind, step, subject, body, thread_id, rfc_message_id, reply_deadline, now_iso()),
         )
         self.conn.commit()
         return cur.lastrowid
@@ -191,6 +202,15 @@ class Database:
             sql += " LIMIT ?"
             params.append(limit)
         return self.conn.execute(sql, params).fetchall()
+
+    def approve_message(self, message_id: int) -> None:
+        self.update_message(message_id, status="approved", approved_at=now_iso())
+
+    def replied_since(self, lead_id: int, since: str) -> bool:
+        """True if an Instagram reply was already sent to this lead at or after `since`."""
+        return self.conn.execute(
+            """SELECT 1 FROM messages WHERE lead_id = ? AND channel = 'instagram' AND kind = 'reply'
+                   AND status = 'sent' AND sent_at >= ?""", (lead_id, since)).fetchone() is not None
 
     def update_message(self, message_id: int, **fields: Any) -> None:
         assignments = ", ".join(f"{k} = ?" for k in fields)

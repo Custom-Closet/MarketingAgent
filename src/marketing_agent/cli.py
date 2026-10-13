@@ -278,7 +278,7 @@ def review(channel: Optional[str] = typer.Option(None, help="email or instagram"
                     db.update_message(row["id"], body=edited.strip())
             choice = "a"
         if choice == "a":
-            db.update_message(row["id"], status="approved")
+            db.approve_message(row["id"])
             approved += 1
         elif choice == "r":
             db.update_message(row["id"], status="rejected")
@@ -320,13 +320,20 @@ def ig_queue() -> None:
             db.update_message(row["id"], status="rejected")
 
 
+def _confirm_ig_send(row, hours_left: float) -> bool:
+    """Final human gate: show exactly what will be sent and require an explicit yes."""
+    console.print(Panel(row["body"], title=f"Send to @{row['ig_username']}?  ({hours_left:.1f}h left in reply window)",
+                        title_align="left"))
+    return typer.prompt("Type y to send, anything else to skip", default="n").strip().lower() == "y"
+
+
 @app.command("ig-inbox")
-def ig_inbox(send_approved: bool = typer.Option(False, "--send", help="Send approved replies")) -> None:
+def ig_inbox(send_approved: bool = typer.Option(False, "--send", help="Send approved replies, confirming each")) -> None:
     """Draft replies to inbound DMs (24h window), or send the approved ones with --send."""
     settings, db = _ctx()
     ig = _instagram(settings)
     if send_approved:
-        n = pipeline.send_ig_replies(db, ig, log=_log)
+        n = pipeline.send_ig_replies(db, ig, confirm=_confirm_ig_send, log=_log)
         _log(f"{n} replies sent.")
     else:
         n = pipeline.sync_instagram(db, ig, _writer(settings), log=_log)
