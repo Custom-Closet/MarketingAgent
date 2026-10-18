@@ -22,7 +22,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlparse
 
 import httpx
@@ -30,15 +30,20 @@ import httpx
 MENTION_RE = re.compile(r"(?<![\w.])@([A-Za-z0-9_.]{1,30})")
 # Meta allows replies for 24h after the user's last message; keep a margin so late sends aren't rejected.
 REPLY_WINDOW = timedelta(hours=23)
+BASIC_MESSAGE_FIELDS = "id,message,from,created_time"
+MESSAGE_FIELDS = BASIC_MESSAGE_FIELDS + ",attachments,shares,story"
 MIN_CALL_INTERVAL = 1.0      # seconds between Graph API calls
 USAGE_LIMIT_PCT = 80         # stop once any usage header reports this much of the quota used
 _RATE_LIMIT_CODES = {4, 17, 32, 613, 80002, 80006}
 _TRANSIENT_CODES = {-2, 1, 2}    # Meta-side timeouts / temporary errors: retried with back-off
+_TOO_MUCH_DATA_CODES = {-1, 1}   # "Fatal" / "reduce the amount of data": retry with a smaller page
 RETRY_DELAYS = (3, 9)            # seconds
 
 
 class InstagramError(RuntimeError):
-    pass
+    def __init__(self, message: str, code: int | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 class InstagramRateLimited(InstagramError):
@@ -87,12 +92,18 @@ class IGProfile:
         return domain_from_url(self.website)
 
 
+def parse_time(value: str) -> datetime:
+    """Graph API timestamps look like 2026-10-17T23:34:32+0000."""
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
+
+
 @dataclass
 class IGConversation:
     recipient_id: str        # IGSID of the other participant
     username: str | None
     last_inbound_text: str | None
     last_inbound_at: datetime | None
+    conversation_id: str = ""
 
     @property
     def can_reply(self) -> bool:
@@ -153,7 +164,8 @@ class InstagramClient:
                 time.sleep(delay)
                 continue
             cls = InstagramRateLimited if err.get("code") in _RATE_LIMIT_CODES else InstagramError
-            raise cls(f"Graph API {path}: {err.get('message', 'HTTP ' + str(resp.status_code))} (code {err.get('code')})")
+            raise cls(f"Graph API {path}: {err.get('message', 'HTTP ' + str(resp.status_code))} (code {err.get('code')})",
+                      err.get("code"))
         if problem := _usage_problem(resp.headers):
             raise InstagramRateLimited(f"Graph API rate limit close: {problem} - stopping early")
         return body
@@ -203,49 +215,82 @@ class InstagramClient:
             raise InstagramError(f"IG_PAGE_ID must be set to {action} with a Facebook Page token")
         return f"/{self.page_id}"
 
-    def conversations(self, limit: int = 25) -> list[IGConversation]:
-        """Conversations updated within the reply window, newest first.
+    def iter_conversations(self, since: datetime, *, fields: str = "updated_time,participants"
+                           ) -> Iterator[dict[str, Any]]:
+        """Conversations updated at or after `since`, newest first, with the requested fields.
 
-        Meta rejects large conversation pages ("reduce the amount of data"), so this lists one
-        conversation per call and stops at the first one too old to reply to.
+        Meta rejects large conversation pages ("reduce the amount of data") and times out on extra
+        list fields, so this lists one conversation id per call, then fetches its details.
         """
         path = f"{self._messaging_node('read Instagram conversations')}/conversations"
-        # Only "id" here: asking for more per page makes Meta time out or reject the request.
         params: dict[str, Any] = {"platform": "instagram", "fields": "id", "limit": 1}
-        cutoff = datetime.now(timezone.utc) - REPLY_WINDOW
-        result = []
-        while len(result) < limit:
+        while True:
             page = self._request("GET", path, params=params)
             if not page.get("data"):
-                break
-            convo = self._request("GET", f"/{page['data'][0]['id']}", params={
-                "fields": "updated_time,participants,messages.limit(5){message,from,created_time}"})
-            if datetime.strptime(convo["updated_time"], "%Y-%m-%dT%H:%M:%S%z") < cutoff:
-                break
-            if parsed := self._parse_conversation(convo):
-                result.append(parsed)
+                return
+            convo = self._request("GET", f"/{page['data'][0]['id']}", params={"fields": fields})
+            if parse_time(convo["updated_time"]) < since:
+                return
+            yield convo
             after = page.get("paging", {}).get("cursors", {}).get("after")
             if not after:
-                break
+                return
             params["after"] = after
+
+    def conversations(self, limit: int = 25) -> list[IGConversation]:
+        """Conversations updated within the reply window, newest first."""
+        fields = f"updated_time,participants,messages.limit(5){{{MESSAGE_FIELDS}}}"
+        result = []
+        for convo in self.iter_conversations(datetime.now(timezone.utc) - REPLY_WINDOW, fields=fields):
+            if parsed := self._parse_conversation(convo):
+                result.append(parsed)
+            if len(result) >= limit:
+                break
         return result
 
-    def messages(self, conversation_id: str, max_messages: int = 20) -> list[dict[str, Any]]:
-        """Full message history of one conversation, oldest first (Meta exposes the latest 20)."""
-        params: dict[str, Any] = {"fields": "message,from,created_time", "limit": 5}
+    def messages(self, conversation_id: str, *, stop_before: datetime | None = None,
+                 max_messages: int | None = None, max_pages: int = 50) -> list[dict[str, Any]]:
+        """Message history of one conversation, oldest first.
+
+        Pages back from the newest message until `stop_before`, `max_messages`, or `max_pages`
+        (a safety limit so one huge chat cannot use up the rate limit).
+        """
+        params: dict[str, Any] = {"fields": MESSAGE_FIELDS, "limit": 25}
         found: list[dict[str, Any]] = []
-        while len(found) < max_messages:
-            page = self._request("GET", f"/{conversation_id}/messages", params=params)
-            found += page.get("data", [])
+        for _ in range(max_pages):
+            try:
+                page = self._request("GET", f"/{conversation_id}/messages", params=params)
+            except InstagramError as exc:
+                # Pages heavy with attachments trip Meta's size limit: retry this page smaller, and if a
+                # single message still fails, fetch it without attachment details.
+                if exc.code not in _TOO_MUCH_DATA_CODES or params["fields"] == BASIC_MESSAGE_FIELDS:
+                    raise
+                if params["limit"] > 1:
+                    params["limit"] = max(1, params["limit"] // 3)
+                else:
+                    params["fields"] = BASIC_MESSAGE_FIELDS
+                continue
+            params.update(fields=MESSAGE_FIELDS, limit=25)
+            data = page.get("data", [])
+            reached_cutoff = False
+            for m in data:
+                if stop_before and parse_time(m["created_time"]) < stop_before:
+                    reached_cutoff = True
+                    break
+                found.append(m)
             after = page.get("paging", {}).get("cursors", {}).get("after")
-            if not page.get("data") or not after:
+            if reached_cutoff or not data or not after or (max_messages and len(found) >= max_messages):
                 break
             params["after"] = after
-        return list(reversed(found[:max_messages]))
+        return list(reversed(found[:max_messages] if max_messages else found))
+
+    def other_participant(self, convo: dict[str, Any]) -> dict[str, Any] | None:
+        """The customer side of a conversation (anyone who is not our IG account)."""
+        return next((p for p in convo.get("participants", {}).get("data", [])
+                     if p.get("id") != self.ig_user_id), None)
 
     def _parse_conversation(self, convo: dict[str, Any]) -> IGConversation | None:
-        other = next((p for p in convo.get("participants", {}).get("data", [])
-                      if p.get("id") != self.ig_user_id), None)
+        other = self.other_participant(convo)
         if not other:
             return None
         inbound = [m for m in convo.get("messages", {}).get("data", [])
@@ -255,7 +300,8 @@ class InstagramClient:
             recipient_id=other["id"],
             username=other.get("username"),
             last_inbound_text=last.get("message") if last else None,
-            last_inbound_at=datetime.strptime(last["created_time"], "%Y-%m-%dT%H:%M:%S%z") if last else None,
+            last_inbound_at=parse_time(last["created_time"]) if last else None,
+            conversation_id=convo.get("id", ""),
         )
 
     def send_reply(self, recipient_id: str, text: str) -> str:

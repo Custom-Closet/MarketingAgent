@@ -14,7 +14,7 @@ from .config import Settings
 from .db import Database
 from .personalize import Personalizer
 from .sources.hunter import HunterClient, HunterError
-from .sources.instagram import REPLY_WINDOW, InstagramClient, InstagramError
+from .sources.instagram import REPLY_WINDOW, InstagramClient, InstagramError, InstagramRateLimited, parse_time
 
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 SENDABLE_EMAIL_STATUSES = {"valid", "accept_all"}
@@ -305,10 +305,74 @@ def sync_gmail(db: Database, gmail: GmailChannel, *, replies: list[tuple[str, st
     return stats
 
 
+TRANSCRIPT_FOR_DRAFTS = 30          # newest stored messages Claude sees when drafting a reply
+ARCHIVE_WINDOW = timedelta(days=90)  # how far back a conversation's history is fetched
+
+
+def archive_conversation(db: Database, ig: InstagramClient, conversation_id: str, *, since: datetime,
+                         igsid: str | None, username: str | None, updated_time: str | None) -> int:
+    """Fetch and store messages newer than what's already archived (back to `since`). Returns new messages.
+
+    The conversation's updated_time is recorded only after its messages are saved, so an
+    interrupted run fetches it again next time.
+    """
+    db.save_ig_conversation(conversation_id, igsid=igsid, username=username, updated_time=None)
+    latest = db.ig_latest_message_time(conversation_id)
+    stop_before = max(since, datetime.fromisoformat(latest)) if latest else since
+    added = db.add_ig_messages(conversation_id, ig.messages(conversation_id, stop_before=stop_before))
+    db.save_ig_conversation(conversation_id, igsid=igsid, username=username, updated_time=updated_time)
+    return added
+
+
+def archive_instagram(db: Database, ig: InstagramClient, *, since: datetime, stats: dict[str, int] | None = None,
+                      log: Log = print) -> dict[str, int]:
+    """Store every DM conversation active since `since`. Resumable: unchanged conversations are skipped.
+
+    `stats` is updated as it goes, so callers can report progress if the run stops early.
+    """
+    stats = stats if stats is not None else {}
+    for key in ("conversations", "skipped", "failed", "messages"):
+        stats.setdefault(key, 0)
+    for convo in ig.iter_conversations(since):
+        stats["conversations"] += 1
+        other = ig.other_participant(convo) or {}
+        updated = parse_time(convo["updated_time"]).astimezone(timezone.utc).isoformat(timespec="seconds")
+        known = db.ig_conversation(convo["id"])
+        if known and known["updated_time"] == updated:
+            stats["skipped"] += 1
+            continue
+        try:
+            added = archive_conversation(db, ig, convo["id"], since=since, igsid=other.get("id"),
+                                         username=other.get("username"), updated_time=updated)
+        except InstagramRateLimited:
+            raise
+        except InstagramError as exc:  # one unreadable chat shouldn't stop the archive; retried next run
+            stats["failed"] += 1
+            log(f"  @{other.get('username', '?')}: skipped ({exc})")
+            continue
+        stats["messages"] += added
+        log(f"  @{other.get('username', '?')}: {added} new messages")
+    return stats
+
+
+def transcript_text(db: Database, conversation_id: str, ig_user_id: str, limit: int | None = None) -> str:
+    """Stored conversation as 'them:' / 'us:' lines, oldest first."""
+    lines = []
+    for m in db.ig_transcript(conversation_id, limit=limit):
+        who = "us" if m["from_id"] == ig_user_id else "them"
+        text = m["text"] or ("<sent an image/attachment>" if m["extras_json"] else "<no text>")
+        lines.append(f"[{m['created_time'][:16]}] {who}: {text}")
+    return "\n".join(lines)
+
+
 def sync_instagram(db: Database, ig: InstagramClient, writer: Personalizer, *, log: Log = print) -> int:
-    """Draft replies for inbound DMs still inside the 24h reply window."""
+    """Archive recent DMs and draft replies for those still inside the reply window."""
     drafted = 0
     for convo in ig.conversations():
+        if convo.conversation_id:
+            # Continue from the last archived message so the stored history has no gaps.
+            archive_conversation(db, ig, convo.conversation_id, since=datetime.now(timezone.utc) - ARCHIVE_WINDOW,
+                                 igsid=convo.recipient_id, username=convo.username, updated_time=None)
         if not convo.can_reply or not convo.last_inbound_text or not convo.username:
             continue
         if db.is_suppressed([convo.username]):
@@ -323,7 +387,9 @@ def sync_instagram(db: Database, ig: InstagramClient, writer: Personalizer, *, l
         ).fetchone()
         if already:
             continue
-        reply = writer.draft_dm_reply(convo.username, convo.last_inbound_text)
+        history = (transcript_text(db, convo.conversation_id, ig.ig_user_id, limit=TRANSCRIPT_FOR_DRAFTS)
+                   if convo.conversation_id else "")
+        reply = writer.draft_dm_reply(convo.username, convo.last_inbound_text, history=history)
         db.add_message(lead_id, "instagram", reply.message, kind="reply", thread_id=convo.recipient_id,
                        reply_deadline=(convo.last_inbound_at + REPLY_WINDOW).isoformat(timespec="seconds"))
         hours_left = (REPLY_WINDOW - (datetime.now(timezone.utc) - convo.last_inbound_at)).total_seconds() / 3600

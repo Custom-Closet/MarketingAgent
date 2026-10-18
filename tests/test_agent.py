@@ -341,3 +341,235 @@ def test_db_migration_adds_gate_columns(tmp_path):
     old.commit(); old.close()
     cols = {r["name"] for r in Database(path).conn.execute("PRAGMA table_info(messages)")}
     assert {"approved_at", "reply_deadline"} <= cols
+
+
+# ---- Instagram DM archive ---------------------------------------------------
+
+def _graph_time(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%S+0000")
+
+
+def _msg(mid, hours_ago, text, sender="42"):
+    return {"id": mid, "message": text, "from": {"id": sender, "username": "fan" if sender == "42" else "brand"},
+            "created_time": _graph_time(datetime.now(timezone.utc) - timedelta(hours=hours_ago))}
+
+
+def test_ig_messages_stop_before_cutoff_and_return_oldest_first():
+    pages = [[_msg("m4", 1, "d"), _msg("m3", 2, "c")], [_msg("m2", 30, "b"), _msg("m1", 40, "a")]]
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.params.get("after"))
+        i = 1 if request.url.params.get("after") else 0
+        return httpx.Response(200, json={"data": pages[i], "paging": {"cursors": {"after": f"p{i + 1}"}}})
+
+    ig = _ig(handler)
+    got = ig.messages("c1", stop_before=datetime.now(timezone.utc) - timedelta(hours=35))
+    assert [m["id"] for m in got] == ["m2", "m3", "m4"] and len(calls) == 2
+    assert [m["id"] for m in ig.messages("c1", max_messages=1)] == ["m4"]
+
+
+def test_add_ig_messages_ignores_duplicates(db):
+    db.save_ig_conversation("c1", igsid="42", username="fan", updated_time=None)
+    batch = [_msg("m1", 2, "hi"), {**_msg("m2", 1, ""), "shares": {"data": [{"link": "https://ig/reel"}], "paging": {}}}]
+    assert db.add_ig_messages("c1", batch) == 2
+    assert db.add_ig_messages("c1", batch) == 0
+    first, second = db.ig_transcript("c1")
+    assert first["text"] == "hi" and second["text"] is None and "paging" not in second["extras_json"]
+
+
+class FakeArchiveIG:
+    ig_user_id = "1784"
+
+    def __init__(self, convos, history):
+        self.convos, self.history, self.fetches = convos, history, []
+
+    def iter_conversations(self, since, **_):
+        yield from self.convos
+
+    def other_participant(self, convo):
+        return convo["participants"]["data"][1]
+
+    def messages(self, conversation_id, *, stop_before=None, **_):
+        self.fetches.append(conversation_id)
+        from marketing_agent.sources.instagram import parse_time
+        return [m for m in self.history[conversation_id] if not stop_before or parse_time(m["created_time"]) >= stop_before]
+
+
+def _archive_convo(cid, updated_hours_ago):
+    return {"id": cid, "updated_time": _graph_time(datetime.now(timezone.utc) - timedelta(hours=updated_hours_ago)),
+            "participants": {"data": [{"id": "1784", "username": "brand"}, {"id": "42", "username": "fan"}]}}
+
+
+def test_archive_skips_unchanged_and_fetches_only_new(db):
+    since = datetime.now(timezone.utc) - timedelta(days=90)
+    ig = FakeArchiveIG([_archive_convo("c1", 1)], {"c1": [_msg("m1", 5, "hi"), _msg("m2", 1, "price?")]})
+    assert pipeline.archive_instagram(db, ig, since=since, log=lambda m: None)["messages"] == 2
+
+    again = pipeline.archive_instagram(db, ig, since=since, log=lambda m: None)
+    assert again == {"conversations": 1, "skipped": 1, "failed": 0, "messages": 0} and ig.fetches == ["c1"]
+
+    ig.convos = [_archive_convo("c1", 0)]                        # new activity
+    ig.history["c1"].append(_msg("m3", 0, "ok, ordering"))
+    assert pipeline.archive_instagram(db, ig, since=since, log=lambda m: None)["messages"] == 1
+    assert [m["id"] for m in db.ig_transcript("c1")] == ["m1", "m2", "m3"]
+
+
+def test_archive_refetches_conversation_interrupted_midway(db):
+    since = datetime.now(timezone.utc) - timedelta(days=90)
+
+    class Boom(FakeArchiveIG):
+        def messages(self, *a, **k):
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        pipeline.archive_instagram(db, Boom([_archive_convo("c1", 1)], {"c1": []}), since=since, log=lambda m: None)
+    assert db.ig_conversation("c1")["updated_time"] is None      # not marked done
+    ig = FakeArchiveIG([_archive_convo("c1", 1)], {"c1": [_msg("m1", 1, "hi")]})
+    assert pipeline.archive_instagram(db, ig, since=since, log=lambda m: None)["messages"] == 1
+
+
+def test_sync_instagram_drafts_with_conversation_history(db):
+    from marketing_agent.sources.instagram import IGConversation
+
+    class SyncIG(FakeArchiveIG):
+        def conversations(self):
+            return [IGConversation("42", "fan", "price?", datetime.now(timezone.utc) - timedelta(hours=1),
+                                   conversation_id="c1")]
+
+    class Writer:
+        def draft_dm_reply(self, username, inbound_text, *, history=""):
+            self.history = history
+            from marketing_agent.personalize import DMDraft
+            return DMDraft(message="It depends on the fabric - could you share a reference image?")
+
+    ig, writer = SyncIG([], {"c1": [_msg("m1", 3, "hi, do you do bulk?"), _msg("m2", 2, "yes!", sender="1784"),
+                                    _msg("m3", 1, "price?")]}), Writer()
+    assert pipeline.sync_instagram(db, ig, writer, log=lambda m: None) == 1
+    assert "them: hi, do you do bulk?" in writer.history and "us: yes!" in writer.history
+    [draft] = db.messages(status="pending", channel="instagram")
+    assert draft["thread_id"] == "42" and draft["reply_deadline"]
+
+
+def test_ig_messages_shrinks_page_when_meta_says_too_much_data():
+    sizes = []
+
+    def handler(request):
+        sizes.append(int(request.url.params["limit"]))
+        if sizes[-1] > 8:
+            return httpx.Response(500, json={"error": {"message": "Fatal", "code": -1}})
+        return httpx.Response(200, json={"data": [_msg("m1", 1, "hi")]})
+
+    assert [m["id"] for m in _ig(handler).messages("c1")] == ["m1"]
+    assert sizes == [25, 8]
+
+
+def test_ig_messages_falls_back_to_basic_fields_for_unreadable_message():
+    seen = []
+
+    def handler(request):
+        seen.append((int(request.url.params["limit"]), "attachments" in request.url.params["fields"]))
+        if "attachments" in request.url.params["fields"]:
+            return httpx.Response(500, json={"error": {"message": "Fatal", "code": -1}})
+        return httpx.Response(200, json={"data": [_msg("m1", 1, "hi")]})
+
+    assert [m["id"] for m in _ig(handler).messages("c1")] == ["m1"]
+    assert seen == [(25, True), (8, True), (2, True), (1, True), (1, False)]
+
+
+def test_archive_continues_past_an_unreadable_conversation(db):
+    from marketing_agent.sources.instagram import InstagramError
+    since = datetime.now(timezone.utc) - timedelta(days=90)
+
+    class Flaky(FakeArchiveIG):
+        def messages(self, conversation_id, **k):
+            if conversation_id == "bad":
+                raise InstagramError("Fatal", -1)
+            return super().messages(conversation_id, **k)
+
+    ig = Flaky([_archive_convo("bad", 1), _archive_convo("c1", 2)], {"c1": [_msg("m1", 2, "hi")]})
+    stats = pipeline.archive_instagram(db, ig, since=since, log=lambda m: None)
+    assert stats["failed"] == 1 and stats["messages"] == 1
+    assert db.ig_conversation("bad")["updated_time"] is None
+
+
+# ---- brand builder ------------------------------------------------------------
+
+class FakeAnthropic:
+    """Just enough of the Anthropic client for BrandBuilder."""
+
+    def __init__(self, merge_text="# Brand profile\n\n## FAQ\n- MOQ? 30 pieces (seen in 2 chats)"):
+        from types import SimpleNamespace as NS
+        from marketing_agent.brand_builder import BatchFindings, FAQ
+        self.prompts, outer = [], self
+
+        class Stream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def get_final_message(self):
+                return NS(stop_reason="end_turn", content=[NS(type="thinking"), NS(type="text", text=merge_text)])
+
+        def parse(**kw):
+            outer.prompts.append(kw["messages"][0]["content"])
+            return NS(stop_reason="end_turn", parsed_output=BatchFindings(
+                faqs=[FAQ(question="MOQ?", answer_given="30 pieces", chats=2)], facts=[], objections=[],
+                conversion_signals=[], winning_replies=[], tone_notes=[]))
+
+        def stream(**kw):
+            outer.prompts.append(kw["messages"][0]["content"])
+            return Stream()
+
+        self.messages = NS(count_tokens=lambda **kw: NS(input_tokens=len(kw["messages"][0]["content"]) // 4))
+        self.beta = NS(messages=NS(parse=parse, stream=stream))
+
+
+def _seed_chat(db, cid, username, lines):
+    db.save_ig_conversation(cid, igsid="42", username=username, updated_time=None)
+    db.add_ig_messages(cid, [_msg(f"{cid}-{i}", 10 - i, text, sender=sender) for i, (sender, text) in enumerate(lines)])
+
+
+def test_brand_builder_batches_chats_and_merges(db, tmp_path, monkeypatch):
+    from marketing_agent import brand_builder
+    from marketing_agent.brand_builder import BrandBuilder
+    monkeypatch.setattr(brand_builder, "BATCH_MAX_CHATS", 2)
+    for n in range(3):
+        _seed_chat(db, f"c{n}", f"fan{n}", [("42", "what is the MOQ?"), ("1784", "30 pieces per design")])
+    _seed_chat(db, "ours-only", "ghost", [("1784", "new collection is live!")])   # no customer messages
+    brand = tmp_path / "brand.md"
+    brand.write_text("# Brand profile\n\n## Who we are\nCustom Closet")
+
+    client = FakeAnthropic()
+    builder = BrandBuilder(brand, model="claude-opus-5-5", effort="medium", client=client)
+    plan = builder.plan(db, "1784", datetime.now(timezone.utc) - timedelta(days=90))
+    assert plan.chats == 3 and len(plan.batches) == 2 and plan.est_cost_usd > 0
+    assert "ghost" not in "".join(plan.batches)
+
+    text = builder.build(plan, log=lambda m: None)
+    assert text.startswith("# Brand profile") and "## FAQ" in text
+    extract_prompt, merge_prompt = client.prompts[0], client.prompts[-1]
+    assert "them: what is the MOQ?" in extract_prompt and "us: 30 pieces per design" in extract_prompt
+    assert "Custom Closet" in merge_prompt and '"answer_given": "30 pieces"' in merge_prompt
+    assert brand.read_text() == "# Brand profile\n\n## Who we are\nCustom Closet"   # untouched
+
+
+def test_brand_builder_rejects_non_markdown_merge(tmp_path):
+    from marketing_agent.brand_builder import BrandBuilder
+    builder = BrandBuilder(tmp_path / "missing.md", model="claude-opus-5-5", effort="medium",
+                           client=FakeAnthropic(merge_text="Sure! Here is your profile..."))
+    with pytest.raises(RuntimeError, match="Markdown heading"):
+        builder.merge([], chats=1)
+
+
+def test_build_brand_cli_refuses_to_overwrite_brand_md(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from marketing_agent import cli
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AGENT_DB_S3_URI", "")
+    monkeypatch.setenv("BRAND_FILE", str(tmp_path / "brand.md"))
+    result = CliRunner().invoke(cli.app, ["build-brand", "--out", str(tmp_path / "brand.md")])
+    assert result.exit_code != 0 and "must not be brand.md" in result.output

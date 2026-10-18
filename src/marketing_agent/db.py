@@ -9,6 +9,7 @@ Lifecycle of a message row:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -61,6 +62,26 @@ CREATE TABLE IF NOT EXISTS targets (
     processed_at    TEXT,
     UNIQUE (kind, value)
 );
+
+-- Local archive of Instagram DMs (both directions), filled by `ig-archive` and the daily sync.
+CREATE TABLE IF NOT EXISTS ig_conversations (
+    id              TEXT PRIMARY KEY,  -- Graph API conversation id
+    igsid           TEXT,              -- customer's Instagram-scoped id (reply recipient)
+    username        TEXT,
+    updated_time    TEXT,              -- last activity per Meta; unchanged means nothing new to fetch
+    synced_at       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ig_messages (
+    id              TEXT PRIMARY KEY,  -- Graph API message id
+    conversation_id TEXT NOT NULL REFERENCES ig_conversations(id),
+    from_id         TEXT,
+    from_username   TEXT,
+    text            TEXT,
+    extras_json     TEXT,              -- attachments / shares / story, when present
+    created_time    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ig_messages_by_conversation ON ig_messages (conversation_id, created_time);
 
 CREATE TABLE IF NOT EXISTS suppression (
     value           TEXT PRIMARY KEY,  -- email address or IG username, lower-cased
@@ -290,6 +311,59 @@ class Database:
 
     def targets(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM targets ORDER BY id DESC LIMIT 100").fetchall()
+
+    # ---- Instagram DM archive ----------------------------------------------
+
+    def ig_conversation(self, conversation_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM ig_conversations WHERE id = ?", (conversation_id,)).fetchone()
+
+    def save_ig_conversation(self, conversation_id: str, *, igsid: str | None, username: str | None,
+                             updated_time: str | None) -> None:
+        self.conn.execute(
+            """INSERT INTO ig_conversations (id, igsid, username, updated_time, synced_at) VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (id) DO UPDATE SET igsid = COALESCE(excluded.igsid, igsid),
+                   username = COALESCE(excluded.username, username),
+                   updated_time = COALESCE(excluded.updated_time, updated_time), synced_at = excluded.synced_at""",
+            (conversation_id, igsid, username, updated_time, now_iso()),
+        )
+        self.conn.commit()
+
+    def add_ig_messages(self, conversation_id: str, messages: Iterable[dict[str, Any]]) -> int:
+        """Store Graph API message dicts; already-stored ids are ignored. Returns how many were new."""
+        rows = []
+        for m in messages:
+            extras = {k: m[k] for k in ("attachments", "shares", "story") if m.get(k)}
+            for value in extras.values():
+                if isinstance(value, dict):
+                    value.pop("paging", None)
+            created = datetime.strptime(m["created_time"], "%Y-%m-%dT%H:%M:%S%z")
+            rows.append((m["id"], conversation_id, m.get("from", {}).get("id"), m.get("from", {}).get("username"),
+                         m.get("message") or None, json.dumps(extras) if extras else None,
+                         created.astimezone(timezone.utc).isoformat(timespec="seconds")))
+        before = self.conn.total_changes
+        self.conn.executemany(
+            """INSERT OR IGNORE INTO ig_messages (id, conversation_id, from_id, from_username, text, extras_json,
+                                                  created_time) VALUES (?, ?, ?, ?, ?, ?, ?)""", rows)
+        self.conn.commit()
+        return self.conn.total_changes - before
+
+    def ig_latest_message_time(self, conversation_id: str) -> str | None:
+        row = self.conn.execute("SELECT MAX(created_time) AS t FROM ig_messages WHERE conversation_id = ?",
+                                (conversation_id,)).fetchone()
+        return row["t"]
+
+    def ig_transcript(self, conversation_id: str, limit: int | None = None) -> list[sqlite3.Row]:
+        """Messages of one conversation, oldest first (the newest `limit` if given)."""
+        rows = self.conn.execute(
+            "SELECT * FROM ig_messages WHERE conversation_id = ? ORDER BY created_time DESC LIMIT ?",
+            (conversation_id, -1 if limit is None else limit)).fetchall()
+        return list(reversed(rows))
+
+    def ig_conversations_since(self, since: datetime) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT c.* FROM ig_conversations c WHERE EXISTS (SELECT 1 FROM ig_messages m
+                   WHERE m.conversation_id = c.id AND m.created_time >= ?) ORDER BY c.updated_time DESC""",
+            (since.astimezone(timezone.utc).isoformat(timespec="seconds"),)).fetchall()
 
     # ---- suppression -----------------------------------------------------
 

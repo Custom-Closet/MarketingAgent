@@ -89,10 +89,12 @@ class Personalizer:
         prompt = f"Write a first Instagram DM to this account.\n\n<lead>\n{lead_context(lead)}\n</lead>"
         return self._parse(prompt, DMDraft)
 
-    def draft_dm_reply(self, username: str | None, inbound_text: str) -> DMDraft:
+    def draft_dm_reply(self, username: str | None, inbound_text: str, *, history: str = "") -> DMDraft:
+        context = (f"<conversation_so_far>\n{history}\n</conversation_so_far>\n\n"
+                   "Don't repeat questions the conversation already answered.\n\n") if history else ""
         prompt = (
             f"@{username or 'someone'} messaged the brand on Instagram. Write a helpful reply that "
             "answers them and, if natural, moves toward a sale or next step.\n\n"
-            f"<their_message>\n{inbound_text}\n</their_message>"
+            f"{context}<their_message>\n{inbound_text}\n</their_message>"
         )
         return self._parse(prompt, DMDraft)

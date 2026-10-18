@@ -340,6 +340,53 @@ def ig_inbox(send_approved: bool = typer.Option(False, "--send", help="Send appr
         _log(f"{n} replies drafted. Review with `agent review --channel instagram`, then `agent ig-inbox --send`.")
 
 
+@app.command("ig-archive")
+def ig_archive(days: int = typer.Option(90, help="Store conversations active in the last N days")) -> None:
+    """Save Instagram DM history to the local database (read-only on Instagram; resumable)."""
+    from datetime import datetime, timedelta, timezone
+
+    from .sources.instagram import InstagramRateLimited
+
+    settings, db = _ctx()
+    ig = _instagram(settings)
+    stats: dict[str, int] = {}
+    try:
+        pipeline.archive_instagram(db, ig, since=datetime.now(timezone.utc) - timedelta(days=days), stats=stats, log=_log)
+    except (InstagramRateLimited, KeyboardInterrupt) as exc:
+        _log(f"[yellow]Stopped early ({exc or 'interrupted'}). Progress is saved - run again to continue.[/yellow]")
+    _log(f"{stats.get('conversations', 0)} conversations checked, {stats.get('skipped', 0)} unchanged, "
+         f"{stats.get('failed', 0)} failed, {stats.get('messages', 0)} new messages stored.")
+
+
+@app.command("build-brand")
+def build_brand(
+    days: int = typer.Option(90, help="Learn from conversations active in the last N days"),
+    out: Optional[Path] = typer.Option(None, help="Draft file to write (default: brand.draft.md next to brand.md)"),
+    yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation"),
+) -> None:
+    """Draft a brand profile (FAQ, policies, sales playbook) from archived DMs. Run `agent ig-archive` first."""
+    from datetime import datetime, timedelta, timezone
+
+    from .brand_builder import BrandBuilder
+
+    settings, db = _ctx()
+    out = out or settings.brand_file.with_name("brand.draft.md")
+    if out.resolve() == settings.brand_file.resolve():
+        raise typer.BadParameter("--out must not be brand.md itself; review the draft and rename it yourself")
+    builder = BrandBuilder(settings.brand_file, model=settings.anthropic_model, effort=settings.anthropic_effort)
+    plan = builder.plan(db, settings.ig_user_id, datetime.now(timezone.utc) - timedelta(days=days))
+    if not plan.chats:
+        _log("No archived conversations in that period. Run `agent ig-archive` first.")
+        raise typer.Exit(1)
+    cost = f"~${plan.est_cost_usd:.2f}" if plan.est_cost_usd is not None else "unknown (model not in price table)"
+    _log(f"{plan.chats} conversations in {len(plan.batches)} batches, {plan.input_tokens:,} transcript tokens, "
+         f"{settings.anthropic_model}: estimated cost {cost}.")
+    if not yes and not typer.confirm("Send these conversations to Claude and draft the profile?", default=False):
+        raise typer.Exit()
+    out.write_text(builder.build(plan, log=_log))
+    _log(f"Draft written to {out}. Review it - especially '## Needs confirmation' - then replace {settings.brand_file}.")
+
+
 # ---- tracking ------------------------------------------------------------
 
 @app.command()

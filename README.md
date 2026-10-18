@@ -79,10 +79,20 @@ If a Workspace admin has restricted third-party API access, they need to mark th
    `pages_read_engagement` and `business_management`. For accounts other than your own, these
    permissions need Meta App Review.
 4. Set `IG_ACCESS_TOKEN`, `IG_USER_ID` (the Instagram business account ID) and `IG_PAGE_ID`.
+5. Subscribe the Page to the app's `messages` webhook field (App Dashboard → Webhooks, or
+   `POST /{page-id}/subscribed_apps?subscribed_fields=messages`). Without this, replies fail with
+   "(#10) This message is sent outside of allowed window".
+
+An Instagram Login token (`IG…`) also works for messaging; the client picks `graph.instagram.com`
+for it automatically. Hashtag search and Business Discovery need the Facebook Page token.
 
 ## Usage
 
 ```bash
+# 0. Teach the agent how the business talks (once, then refine)
+uv run agent ig-archive --days 90                        # save DM history locally; resumable, rate-limited
+uv run agent build-brand --days 90                       # Claude drafts brand.draft.md - review, then rename to brand.md
+
 # 1. Find leads
 uv run agent find domain acme.com glossier.com --department marketing
 uv run agent find instagram -u cafeluna -u bluebottle --min-followers 5000
@@ -103,8 +113,8 @@ uv run agent ig-queue                                    # assisted Instagram DM
 # 4. Track and follow up (the Lambda daily run does all of this for you)
 uv run agent sync                                        # replies, bounces, unsubscribes
 uv run agent draft --followups --limit 0                 # follow-ups for unanswered threads
-uv run agent ig-inbox                                    # draft replies to inbound DMs
-uv run agent ig-inbox --send                             # send the approved replies
+uv run agent ig-inbox                                    # draft replies to inbound DMs (uses the chat history)
+uv run agent ig-inbox --send                             # send approved replies, confirming each one
 uv run agent status
 ```
 
