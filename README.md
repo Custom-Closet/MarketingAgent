@@ -44,7 +44,8 @@ uv run agent init        # creates brand.md, .env and the database
 ```
 
 Then fill in `brand.md` (who you are, who you're targeting, the offer, your voice). Every draft is
-based on it, so be specific. After that, add credentials to `.env`:
+based on it, so be specific. `brand.md` holds business details (prices, phone, addresses), so it is
+gitignored; `brand.example.md` is the committed template. After that, add credentials to `.env`:
 
 ### 1. Claude
 Create a key at [console.anthropic.com](https://console.anthropic.com) and set `ANTHROPIC_API_KEY`.

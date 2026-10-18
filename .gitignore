@@ -13,6 +13,20 @@ wheels/
 .env
 credentials.json
 data/
+*.log
+
+# Business-specific content (contact details, prices) - templates are committed as *.example.*
+brand.md
+brand.draft.md
+faqs.json
+
+# Lead-finder output (customer data)
+*_leads.csv
+seen_brands.csv
+
+# OS / tooling
+.DS_Store
+.pytest_cache/
 
 # Build output
 infra/cdk.out/
