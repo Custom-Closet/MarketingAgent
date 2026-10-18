@@ -387,6 +387,43 @@ def build_brand(
     _log(f"Draft written to {out}. Review it - especially '## Needs confirmation' - then replace {settings.brand_file}.")
 
 
+@app.command()
+def serve(
+    port: int = typer.Option(8000, help="Port for the local inbox"),
+    host: str = typer.Option("127.0.0.1", help="Use 0.0.0.0 to open it from a phone on the same Wi-Fi"),
+    open_browser: bool = typer.Option(True, "--open/--no-open", help="Open the inbox in the browser"),
+) -> None:
+    """Open the local inbox: review, bulk-approve and send Instagram replies."""
+    import threading
+
+    import uvicorn
+
+    from .db import Database
+    from .inbox.api import create_app
+    from .inbox.faq import load_faq_file
+    from .inbox.repository import InboxRepository
+    from .inbox.service import InboxService
+
+    settings = load_settings()
+    if settings.db_s3_uri:
+        raise typer.BadParameter("`agent serve` uses the local database; unset AGENT_DB_S3_URI to run it")
+    db = Database(settings.db_path, check_same_thread=False)
+    repo = InboxRepository(db)
+    added = repo.seed_faqs(load_faq_file(settings.faq_file))
+    writer = None
+    try:
+        writer = clients.writer(settings)
+    except FileNotFoundError:
+        _log("[yellow]brand.md not found - 'Draft with Claude' is disabled.[/yellow]")
+    service = InboxService(repo, our_id=settings.ig_user_id, ig=clients.instagram_client(settings), writer=writer)
+    service.refresh_drafts()
+    url = f"http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}"
+    _log(f"Inbox at {url}  ({added} new FAQs loaded from {settings.faq_file}). Ctrl+C to stop.")
+    if open_browser:
+        threading.Timer(1.0, webbrowser.open, args=(url,)).start()
+    uvicorn.run(create_app(service), host=host, port=port, log_level="warning")
+
+
 # ---- tracking ------------------------------------------------------------
 
 @app.command()

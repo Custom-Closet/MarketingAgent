@@ -1,0 +1,24 @@
+[
+  {
+    "key": "location",
+    "question": "Where are you based?",
+    "keywords": [
+      "based",
+      "located",
+      "location",
+      "which city"
+    ],
+    "answer": "Hi! We are based in <city>, we deliver <where>"
+  },
+  {
+    "key": "pricing",
+    "question": "What's the price?",
+    "keywords": [
+      "price",
+      "pricing",
+      "cost",
+      "how much"
+    ],
+    "answer": "Our prices differ from product to product - please share a reference image and we'll quote"
+  }
+]

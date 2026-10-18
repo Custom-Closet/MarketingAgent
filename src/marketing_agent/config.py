@@ -27,6 +27,7 @@ class Settings:
     db_path: Path
     db_s3_uri: str          # s3://bucket/key - share one database between Lambda and the CLI
     brand_file: Path
+    faq_file: Path          # seed answers for the inbox (faqs.json, gitignored)
 
     # Claude
     anthropic_model: str
@@ -75,6 +76,7 @@ def load_settings() -> Settings:
         db_path=Path(_env("AGENT_DB_PATH", str(data_dir / "agent.db"))),
         db_s3_uri=_env("AGENT_DB_S3_URI"),
         brand_file=Path(_env("BRAND_FILE", "brand.md")),
+        faq_file=Path(_env("FAQ_FILE", "faqs.json")),
         anthropic_model=_env("ANTHROPIC_MODEL", "claude-opus-5-5"),
         anthropic_effort=_env("ANTHROPIC_EFFORT", "medium"),
         hunter_api_key=_env("HUNTER_API_KEY"),

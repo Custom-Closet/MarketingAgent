@@ -119,6 +119,27 @@ uv run agent ig-inbox --send                             # send approved replies
 uv run agent status
 ```
 
+## Inbox (web app for replying to DMs)
+
+```bash
+cp faqs.example.json faqs.json   # then write your real FAQ answers (faqs.json is gitignored)
+uv run agent serve               # opens http://localhost:8000
+```
+
+1. **Check for new messages** reads chats from the last 23 hours (read-only, rate-limited) and
+   prepares a reply for every customer still waiting. Common questions are pre-filled from the FAQ.
+2. **FAQ answers** tab: approve each answer once. From then on, replies that use an approved
+   answer unchanged can all be approved with **Approve all** on the inbox.
+3. Filter by priority (high = asking about price/samples, sent a reference image, a clothing brand, or
+   the 24-hour window is closing), topic, customer type or "closing soon". Select chats to approve,
+   fill in an FAQ answer, or dismiss in bulk. **Draft with Claude** writes a reply from the whole chat.
+4. **Send approved** shows every message that will go out and sends only after you confirm. A reply is
+   skipped if the window has closed, the customer was already answered in the Instagram app, or they
+   unsubscribed. At most 25 per batch.
+
+Nothing is ever sent without approval and that final confirmation. `agent serve` uses the local
+database (`AGENT_DB_PATH`); it refuses to start when `AGENT_DB_S3_URI` is set.
+
 ## Daily run on AWS Lambda
 
 Every morning at **08:00 India time**, EventBridge Scheduler starts a Lambda function that runs the

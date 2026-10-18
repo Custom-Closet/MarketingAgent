@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at      TEXT NOT NULL,
     approved_at     TEXT,
     reply_deadline  TEXT,              -- IG replies: last send time Meta allows (inbound + reply window)
+    faq_key         TEXT,              -- IG replies: FAQ whose answer the draft started from
     sent_at         TEXT
 );
 
@@ -83,6 +84,16 @@ CREATE TABLE IF NOT EXISTS ig_messages (
 );
 CREATE INDEX IF NOT EXISTS ig_messages_by_conversation ON ig_messages (conversation_id, created_time);
 
+-- Reusable answers for common DM questions; only approved ones can be bulk-approved in the inbox.
+CREATE TABLE IF NOT EXISTS faqs (
+    key             TEXT PRIMARY KEY,
+    question        TEXT NOT NULL,
+    answer          TEXT NOT NULL,
+    keywords_json   TEXT NOT NULL,     -- lower-case phrases that identify the question
+    approved        INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS suppression (
     value           TEXT PRIMARY KEY,  -- email address or IG username, lower-cased
     reason          TEXT,
@@ -101,11 +112,12 @@ def now_iso() -> str:
 
 
 class Database:
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, *, check_same_thread: bool = True):
+        """`check_same_thread=False` lets a web server share the connection; callers must serialise access."""
         path = Path(path)
         if str(path) != ":memory:":
             path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(path))
+        self.conn = sqlite3.connect(str(path), check_same_thread=check_same_thread)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
@@ -114,7 +126,7 @@ class Database:
     def _migrate(self) -> None:
         """Add columns introduced after a database was first created."""
         have = {row["name"] for row in self.conn.execute("PRAGMA table_info(messages)")}
-        for column in ("approved_at", "reply_deadline"):
+        for column in ("approved_at", "reply_deadline", "faq_key"):
             if column not in have:
                 self.conn.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
         self.conn.commit()
@@ -201,12 +213,14 @@ class Database:
 
     def add_message(self, lead_id: int, channel: str, body: str, *, kind: str = "initial",
                     step: int = 0, subject: str | None = None, thread_id: str | None = None,
-                    rfc_message_id: str | None = None, reply_deadline: str | None = None) -> int:
+                    rfc_message_id: str | None = None, reply_deadline: str | None = None,
+                    faq_key: str | None = None) -> int:
         cur = self.conn.execute(
             """INSERT INTO messages (lead_id, channel, kind, step, subject, body, thread_id,
-                                     rfc_message_id, reply_deadline, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (lead_id, channel, kind, step, subject, body, thread_id, rfc_message_id, reply_deadline, now_iso()),
+                                     rfc_message_id, reply_deadline, faq_key, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (lead_id, channel, kind, step, subject, body, thread_id, rfc_message_id, reply_deadline, faq_key,
+             now_iso()),
         )
         self.conn.commit()
         return cur.lastrowid
