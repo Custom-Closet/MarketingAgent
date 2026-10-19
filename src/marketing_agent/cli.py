@@ -403,6 +403,7 @@ def serve(
     from .inbox.faq import load_faq_file
     from .inbox.repository import InboxRepository
     from .inbox.service import InboxService
+    from .insights.service import InsightsService
 
     settings = load_settings()
     if settings.db_s3_uri:
@@ -417,11 +418,17 @@ def serve(
         _log("[yellow]brand.md not found - 'Draft with Claude' is disabled.[/yellow]")
     service = InboxService(repo, our_id=settings.ig_user_id, ig=clients.instagram_client(settings), writer=writer)
     service.refresh_drafts()
+    strategist = None
+    if writer is not None:
+        from .insights.strategist import Strategist
+        strategist = Strategist(settings.brand_file.read_text(), model=settings.anthropic_model,
+                                effort=settings.anthropic_effort, client=writer.client)
+    insights = InsightsService(db, our_id=settings.ig_user_id, lock=service.lock, strategist=strategist)
     url = f"http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}"
     _log(f"Inbox at {url}  ({added} new FAQs loaded from {settings.faq_file}). Ctrl+C to stop.")
     if open_browser:
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()
-    uvicorn.run(create_app(service), host=host, port=port, log_level="warning")
+    uvicorn.run(create_app(service, insights), host=host, port=port, log_level="warning")
 
 
 # ---- tracking ------------------------------------------------------------

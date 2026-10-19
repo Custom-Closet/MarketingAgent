@@ -3,119 +3,134 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Custom Closet Inbox</title>
-<style>
-  :root {
-    --bg: #f7f5f2; --card: #fff; --ink: #1f1d1a; --muted: #6f6a63; --line: #e6e1da;
-    --accent: #7a4b2a; --accent-ink: #fff; --high: #b42318; --high-bg: #fde7e4;
-    --med: #9a6700; --med-bg: #fff4d6; --low: #4b5563; --low-bg: #eef0f2; --ok: #1a7f37; --ok-bg: #dcf5e3;
-  }
-  * { box-sizing: border-box; }
-  [hidden] { display: none !important; }
-  body { overflow-x: hidden; margin: 0; font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
-  header { position: sticky; top: 0; z-index: 5; background: var(--card); border-bottom: 1px solid var(--line); padding: 12px 20px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
-  header h1 { font-size: 18px; margin: 0; }
-  .tabs { display: flex; gap: 4px; }
-  .tabs button { border: 0; background: none; padding: 8px 12px; border-radius: 8px; font: inherit; color: var(--muted); cursor: pointer; }
-  .tabs button.active { background: var(--bg); color: var(--ink); font-weight: 600; }
-  .spacer { flex: 1; }
-  .stat { font-size: 13px; color: var(--muted); }
-  .stat b { color: var(--ink); }
-  main { max-width: 1080px; margin: 0 auto; padding: 16px 20px 120px; }
-  button.btn { font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--ink); padding: 7px 12px; border-radius: 8px; cursor: pointer; white-space: nowrap; }
-  button.btn:hover { border-color: #cfc7bc; }
-  button.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
-  button.btn.ghost { border-color: transparent; background: none; color: var(--muted); }
-  button.btn:disabled { opacity: .45; cursor: default; }
-  .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
-  .chip-toggle { border: 1px solid var(--line); background: var(--card); border-radius: 999px; padding: 5px 12px; cursor: pointer; font: inherit; font-size: 14px; }
-  .chip-toggle.on { background: var(--ink); color: #fff; border-color: var(--ink); }
-  select, input[type=search] { font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); }
-  .banner { display: flex; align-items: center; gap: 12px; background: var(--ok-bg); border: 1px solid #b7e4c4; padding: 10px 14px; border-radius: 10px; margin-bottom: 12px; }
-  .bulkbar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--card); border-top: 1px solid var(--line); padding: 12px 20px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center; z-index: 5; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 10px; display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 10px; }
-  .card.approved { border-color: #9fd8ae; }
-  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  .who { font-weight: 600; }
-  .who a { color: inherit; }
-  .pill { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--low-bg); color: var(--low); }
-  .pill.high { background: var(--high-bg); color: var(--high); }
-  .pill.medium { background: var(--med-bg); color: var(--med); }
-  .pill.ok { background: var(--ok-bg); color: var(--ok); }
-  .time { font-size: 13px; color: var(--muted); }
-  .time.urgent { color: var(--high); font-weight: 600; }
-  .said { overflow-wrap: anywhere; margin: 8px 0; padding: 8px 10px; background: var(--bg); border-radius: 8px; white-space: pre-wrap; }
-  .said .att { color: var(--muted); font-style: italic; }
-  .reasons { font-size: 12px; color: var(--muted); }
-  textarea { width: 100%; font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; min-height: 64px; resize: vertical; }
-  .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
-  .transcript { margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 8px; max-height: 280px; overflow: auto; font-size: 14px; }
-  .msg { margin: 4px 0; padding: 6px 10px; border-radius: 10px; max-width: 80%; white-space: pre-wrap; }
-  .msg.them { background: var(--bg); }
-  .msg.us { background: #f1e7de; margin-left: auto; }
-  .empty { text-align: center; color: var(--muted); padding: 48px 0; }
-  .faq { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 10px; }
-  .faq h3 { margin: 0 0 4px; font-size: 15px; }
-  .kw { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
-  dialog { border: 0; border-radius: 14px; padding: 0; width: min(640px, 94vw); box-shadow: 0 20px 60px rgba(0,0,0,.25); }
-  dialog .body { padding: 18px 20px; max-height: 60vh; overflow: auto; }
-  dialog .foot { padding: 12px 20px; border-top: 1px solid var(--line); display: flex; gap: 8px; justify-content: flex-end; }
-  .confirm-item { padding: 8px 0; border-bottom: 1px solid var(--line); }
-  .toast { position: fixed; top: 70px; right: 20px; background: var(--ink); color: #fff; padding: 10px 14px; border-radius: 10px; z-index: 10; max-width: 380px; }
-  input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--accent); }
-  @media (max-width: 640px) { main { padding: 12px 12px 160px; } .card { grid-template-columns: 24px minmax(0, 1fr); } .banner { flex-wrap: wrap; } input[type=search] { flex: 1 1 100%; } }
-</style>
+<title>Custom Closet</title>
+<link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-<header>
-  <h1>Custom Closet Inbox</h1>
-  <div class="tabs">
-    <button id="tab-inbox" class="active" onclick="showTab('inbox')">Inbox</button>
-    <button id="tab-faq" onclick="showTab('faq')">FAQ answers</button>
-  </div>
-  <div class="spacer"></div>
-  <span class="stat" id="stats"></span>
-  <button class="btn" id="sync-btn" onclick="sync()">Check for new messages</button>
-</header>
+<nav class="sidebar" aria-label="Modules">
+  <div class="brand">Custom Closet<small>Sales studio</small></div>
+  <button class="nav" data-module="chat" onclick="go('chat')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 5h16v11H8l-4 4z"/></svg>
+    Chat <span class="badge" id="chat-badge" hidden></span></button>
+  <button class="nav" data-module="sales" onclick="go('sales')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 4h18l-7 8v6l-4 2v-8z"/></svg>
+    Sales</button>
+  <button class="nav" data-module="marketing" onclick="go('marketing')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 11v2l13 5V6zM16 9a3 3 0 0 1 0 6"/></svg>
+    Marketing</button>
+  <button class="nav" data-module="settings" onclick="go('settings')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1"/></svg>
+    Settings</button>
+</nav>
 
-<main>
-  <section id="inbox">
-    <div class="filters">
-      <button class="chip-toggle" data-priority="high" onclick="togglePriority(this)">High priority</button>
-      <button class="chip-toggle" data-priority="medium" onclick="togglePriority(this)">Medium</button>
-      <button class="chip-toggle" data-priority="low" onclick="togglePriority(this)">Low</button>
-      <button class="chip-toggle" id="closing" onclick="this.classList.toggle('on'); load()">Closing soon (&lt; 4h)</button>
-      <select id="f-category" onchange="load()"><option value="">All topics</option></select>
-      <select id="f-type" onchange="load()">
-        <option value="">All customers</option><option value="brand">Clothing brands</option>
-        <option value="personal">Personal use</option><option value="unknown">Unknown</option>
-      </select>
-      <select id="f-status" onchange="load()">
-        <option value="">Needs review + approved</option><option value="pending">Needs review</option>
-        <option value="approved">Approved, not sent</option>
-      </select>
-      <input type="search" id="f-q" placeholder="Search name or message" oninput="debouncedLoad()">
+<div class="shell">
+  <!-- ======================= CHAT ======================= -->
+  <section id="chat" data-title="Chat" hidden>
+    <div class="topbar">
+      <h1>Chat</h1><div class="spacer"></div>
+      <span class="stat" id="stats"></span>
+      <button class="btn" id="sync-btn" onclick="sync()">Check for new messages</button>
     </div>
-    <div class="banner" id="faq-banner" hidden>
-      <span id="faq-banner-text"></span><div class="spacer"></div>
-      <button class="btn primary" onclick="approveFaqReplies()">Approve all</button>
+    <main>
+      <div class="filters">
+        <button class="chip-toggle" data-priority="high" onclick="togglePriority(this)">High priority</button>
+        <button class="chip-toggle" data-priority="medium" onclick="togglePriority(this)">Medium</button>
+        <button class="chip-toggle" data-priority="low" onclick="togglePriority(this)">Low</button>
+        <button class="chip-toggle" id="closing" onclick="this.classList.toggle('on'); loadChat()">Closing soon (&lt; 4h)</button>
+        <select id="f-category" onchange="loadChat()"><option value="">All topics</option></select>
+        <select id="f-type" onchange="loadChat()">
+          <option value="">All customers</option><option value="brand">Clothing brands</option>
+          <option value="personal">Personal use</option><option value="unknown">Unknown</option>
+        </select>
+        <select id="f-status" onchange="loadChat()">
+          <option value="">Needs review + approved</option><option value="pending">Needs review</option>
+          <option value="approved">Approved, not sent</option>
+        </select>
+        <input type="search" id="f-q" placeholder="Search name or message" oninput="debouncedLoadChat()">
+      </div>
+      <div class="banner" id="faq-banner" hidden>
+        <span id="faq-banner-text"></span><div class="spacer"></div>
+        <button class="btn primary" onclick="approveFaqReplies()">Approve all</button>
+      </div>
+      <div id="queue"></div>
+    </main>
+    <div class="bulkbar" id="bulkbar">
+      <label class="row"><input type="checkbox" id="select-all" onchange="selectAll(this.checked)"> <span id="sel-count">Select all</span></label>
+      <button class="btn" onclick="bulkApprove()" data-needs-selection>Approve</button>
+      <select id="bulk-faq" onchange="bulkApplyFaq(this)" data-needs-selection><option value="">Use FAQ answer…</option></select>
+      <button class="btn ghost" onclick="bulkReject()" data-needs-selection>Dismiss</button>
+      <button class="btn primary" onclick="openSend()" id="send-btn">Send approved</button>
     </div>
-    <div id="queue"></div>
   </section>
 
-  <section id="faq" hidden>
-    <p class="stat">Approved answers can be approved in bulk from the inbox with one click. Editing an answer
-      removes its approval until you approve it again.</p>
-    <div id="faq-list"></div>
+  <!-- ======================= SALES ======================= -->
+  <section id="sales" data-title="Sales" hidden>
+    <div class="topbar">
+      <h1>Sales funnel</h1><div class="spacer"></div>
+      <select id="s-days" onchange="loadSales()"><option value="30">Last 30 days</option><option value="60">Last 60 days</option><option value="90" selected>Last 90 days</option></select>
+      <select id="s-segment" onchange="loadSales()"><option value="">All customers</option><option value="brand">Clothing brands</option><option value="personal">Personal use</option><option value="unknown">Unknown</option></select>
+      <select id="s-source" onchange="loadSales()"><option value="">All sources</option></select>
+    </div>
+    <main>
+      <div class="tiles" id="s-tiles"></div>
+      <div class="grid">
+        <div class="panel"><h2>Funnel</h2><p class="sub">Leads that reached each stage · % = share of the previous stage. Click a stage to list its leads.</p><div class="hbars" id="s-funnel"></div></div>
+        <div class="panel"><h2>Why leads were lost</h2><p class="sub" id="s-lost-sub"></p><div class="hbars" id="s-drop"></div></div>
+      </div>
+      <div class="grid">
+        <div class="panel"><h2>New leads per week</h2><p class="sub">Conversations started, by week (Monday)</p><div class="cols" id="s-weekly"></div></div>
+        <div class="panel"><h2>Lead sources</h2><p class="sub">How leads arrive and how often they reach a quote or an order</p><div class="table-wrap" id="s-sources"></div></div>
+      </div>
+      <div class="panel" style="margin-bottom:14px">
+        <div class="row"><h2 style="margin:0">Open pipeline</h2><span class="spacer"></span><span class="sub" style="margin:0">Drag a card (or use its menu) to correct its stage</span></div>
+        <div class="board" id="s-board" style="margin-top:10px"></div>
+      </div>
+      <div class="panel" style="margin-bottom:14px" id="s-list-panel" hidden>
+        <div class="row"><h2 style="margin:0" id="s-list-title"></h2><span class="spacer"></span><button class="btn ghost" onclick="closeLeadList()">Close</button></div>
+        <div class="table-wrap" id="s-list" style="margin-top:8px"></div>
+      </div>
+      <div class="panel">
+        <h2>Ask the strategist</h2>
+        <p class="sub">Claude reads these funnel numbers and a few anonymised lost chats, then suggests what to change. Shows the cost before it runs.</p>
+        <div class="presets" id="s-presets"></div>
+        <div class="chatlog" id="s-chat"></div>
+        <textarea id="s-question" placeholder="Ask about your funnel, e.g. how do I convert more 'bulk pricing' leads?"></textarea>
+        <div class="actions"><button class="btn primary" id="s-ask" onclick="askStrategist()">Ask</button>
+          <button class="btn ghost" onclick="resetStrategist()">New conversation</button><span class="stat" id="s-cost"></span></div>
+      </div>
+    </main>
   </section>
-</main>
 
-<div class="bulkbar" id="bulkbar">
-  <label class="row"><input type="checkbox" id="select-all" onchange="selectAll(this.checked)"> <span id="sel-count">Select all</span></label>
-  <button class="btn" onclick="bulkApprove()" data-needs-selection>Approve</button>
-  <select id="bulk-faq" onchange="bulkApplyFaq(this)" data-needs-selection><option value="">Use FAQ answer…</option></select>
-  <button class="btn ghost" onclick="bulkReject()" data-needs-selection>Dismiss</button>
-  <button class="btn primary" onclick="openSend()" id="send-btn">Send approved</button>
+  <!-- ======================= MARKETING ======================= -->
+  <section id="marketing" data-title="Marketing" hidden>
+    <div class="topbar">
+      <h1>Marketing</h1><div class="spacer"></div>
+      <select id="m-days" onchange="loadMarketing()"><option value="30">Last 30 days</option><option value="60">Last 60 days</option><option value="90" selected>Last 90 days</option></select>
+    </div>
+    <main>
+      <div class="tiles" id="m-tiles"></div>
+      <div class="panel" style="margin-bottom:14px"><h2>Outreach messages</h2><p class="sub">Each opening message we sent first. "Real replies" exclude other brands' instant auto-responses.</p><div class="table-wrap" id="m-templates"></div></div>
+      <div class="panel"><h2>Where leads come from</h2><p class="sub">Every source, with how often it reaches a quote or an order</p><div class="table-wrap" id="m-sources"></div></div>
+    </main>
+  </section>
+
+  <!-- ======================= SETTINGS ======================= -->
+  <section id="settings" data-title="Settings" hidden>
+    <div class="topbar"><h1>Settings</h1></div>
+    <main>
+      <div class="grid">
+        <div class="panel"><h2>Status</h2><ul class="status-list" id="st-status"></ul></div>
+        <div class="panel"><h2>Drafting & funnel</h2>
+          <div class="form-row"><label for="st-window">Days of chat Claude reads word for word<br><span class="muted" style="font-size:12px">Older messages are sent as a short summary</span></label><input type="number" id="st-window" min="1" max="60" style="width:80px"></div>
+          <div class="form-row"><label for="st-lost">Mark a lead lost after (days of silence)</label><input type="number" id="st-lost" min="3" max="120" style="width:80px"></div>
+          <button class="btn primary" onclick="saveSettings()">Save</button>
+        </div>
+      </div>
+      <h2 style="font-size:16px">FAQ answers</h2>
+      <p class="stat">Approved answers can be approved in bulk from Chat with one click. Editing an answer removes its approval until you approve it again.</p>
+      <div id="faq-list"></div>
+    </main>
+  </section>
 </div>
 
 <dialog id="send-dialog">
@@ -125,253 +140,20 @@
     <button class="btn primary" id="send-confirm" onclick="confirmSend()">Send</button>
   </div>
 </dialog>
+<dialog id="cost-dialog">
+  <div class="body"><h2 style="margin-top:0">Ask Claude?</h2><p id="cost-text"></p></div>
+  <div class="foot">
+    <button class="btn" onclick="document.getElementById('cost-dialog').close()">Cancel</button>
+    <button class="btn primary" id="cost-confirm" onclick="confirmStrategist()">Ask Claude</button>
+  </div>
+</dialog>
+<div id="tooltip" hidden></div>
 
-<script>
-const state = { items: [], faqs: [], selected: new Set(), priority: new Set(), openChat: new Set() };
-const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-
-async function api(path, opts = {}) {
-  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts,
-    body: opts.body ? JSON.stringify(opts.body) : undefined });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.detail || res.statusText);
-  return data;
-}
-
-function toast(text) {
-  const el = document.createElement("div");
-  el.className = "toast"; el.textContent = text; document.body.appendChild(el);
-  setTimeout(() => el.remove(), 4000);
-}
-
-function showTab(name) {
-  for (const t of ["inbox", "faq"]) { $(t).hidden = t !== name; $("tab-" + t).classList.toggle("active", t === name); }
-  $("bulkbar").hidden = name !== "inbox";
-  if (name === "faq") renderFaqs();
-}
-
-function togglePriority(el) {
-  el.classList.toggle("on");
-  const p = el.dataset.priority;
-  state.priority.has(p) ? state.priority.delete(p) : state.priority.add(p);
-  load();
-}
-
-function filterParams() {
-  const p = new URLSearchParams();
-  if (state.priority.size) p.set("priority", [...state.priority].join(","));
-  if ($("closing").classList.contains("on")) p.set("max_hours_left", "4");
-  for (const [id, key] of [["f-category", "category"], ["f-type", "customer_type"], ["f-status", "status"], ["f-q", "q"]]) {
-    if ($(id).value) p.set(key, $(id).value);
-  }
-  return p;
-}
-
-let loadTimer;
-function debouncedLoad() { clearTimeout(loadTimer); loadTimer = setTimeout(load, 250); }
-
-async function load() {
-  try {
-    [state.items, state.faqs] = await Promise.all([api("/api/queue?" + filterParams()), api("/api/faqs")]);
-  } catch (e) { toast("Couldn't load the inbox: " + e.message); return; }
-  const visible = new Set(state.items.map((i) => i.draft_id));
-  for (const id of [...state.selected]) if (!visible.has(id)) state.selected.delete(id);
-  renderFilters(); renderQueue(); loadStats();
-}
-
-async function loadStats() {
-  const s = await api("/api/stats").catch(() => null);
-  if (!s) return;
-  const sync = s.sync.running ? ` · syncing… (${s.sync.conversations} chats)` : s.sync.last_error ? ` · last sync failed: ${esc(s.sync.last_error)}` : "";
-  $("stats").innerHTML = `<b>${s.open}</b> to reply · <b>${s.high}</b> high · <b>${s.closing_soon}</b> closing soon · <b>${s.sent_24h}</b> sent today${sync}`;
-  $("sync-btn").disabled = s.sync.running;
-  if (s.sync.running) setTimeout(() => load(), 4000);
-}
-
-function faqName(key) {
-  const f = state.faqs.find((f) => f.key === key);
-  return f ? f.question : { reference_image: "Sent an image", greeting: "Just said hi", other: "Other question" }[key] || key;
-}
-
-function renderFilters() {
-  const cat = $("f-category"), current = cat.value;
-  const keys = [...new Set([...state.faqs.map((f) => f.key), "reference_image", "greeting", "other"])];
-  cat.innerHTML = `<option value="">All topics</option>` + keys.map((k) => `<option value="${esc(k)}">${esc(faqName(k))}</option>`).join("");
-  cat.value = current;
-  const bulk = $("bulk-faq");
-  bulk.innerHTML = `<option value="">Use FAQ answer…</option>` + state.faqs.map((f) => `<option value="${esc(f.key)}">${esc(f.question)}</option>`).join("");
-}
-
-function hoursText(h) {
-  if (h <= 0) return "window closed";
-  return h < 1 ? `${Math.round(h * 60)} min left` : `${h.toFixed(h < 10 ? 1 : 0)}h left`;
-}
-
-function renderQueue() {
-  const ready = state.items.filter((i) => i.status === "pending" && i.faq_approved);
-  $("faq-banner").hidden = !ready.length;
-  $("faq-banner-text").textContent = `${ready.length} ${ready.length === 1 ? "reply uses" : "replies use"} an approved FAQ answer and ${ready.length === 1 ? "is" : "are"} ready to approve.`;
-  if (!state.items.length) {
-    $("queue").innerHTML = `<div class="empty">Nothing waiting. Press “Check for new messages” to look again.</div>`;
-  } else {
-    $("queue").innerHTML = state.items.map(card).join("");
-  }
-  const approved = state.items.filter((i) => i.status === "approved").length;
-  $("send-btn").textContent = `Send approved (${approved})`;
-  $("send-btn").disabled = !approved;
-  $("sel-count").textContent = state.selected.size ? `${state.selected.size} selected` : "Select all";
-  $("select-all").checked = state.items.length > 0 && state.selected.size === state.items.length;
-  document.querySelectorAll("[data-needs-selection]").forEach((el) => (el.disabled = !state.selected.size));
-}
-
-function card(i) {
-  const said = i.customer_messages.map(esc).join("\n") + (i.sent_attachment ? `\n<span class="att">[sent an image / attachment]</span>` : "");
-  const chat = state.openChat.has(i.draft_id) ? `<div class="transcript" id="chat-${i.draft_id}">Loading…</div>` : "";
-  return `<div class="card ${i.status === "approved" ? "approved" : ""}">
-    <input type="checkbox" ${state.selected.has(i.draft_id) ? "checked" : ""} onchange="toggleSelect(${i.draft_id}, this.checked)">
-    <div>
-      <div class="row">
-        <span class="who"><a href="https://ig.me/m/${esc(i.username)}" target="_blank" rel="noopener">@${esc(i.username)}</a></span>
-        <span class="pill ${i.priority}">${i.priority}</span>
-        <span class="pill">${esc(faqName(i.category))}</span>
-        ${i.customer_type !== "unknown" ? `<span class="pill">${i.customer_type === "brand" ? "clothing brand" : "personal"}</span>` : ""}
-        ${i.status === "approved" ? `<span class="pill ok">approved</span>` : ""}
-        <span class="spacer"></span>
-        <span class="time ${i.hours_left <= 4 ? "urgent" : ""}">${hoursText(i.hours_left)}</span>
-      </div>
-      <div class="said">${said || '<span class="att">(no text)</span>'}</div>
-      ${i.reasons.length ? `<div class="reasons">Why: ${esc(i.reasons.join(" · "))}</div>` : ""}
-      ${i.error ? `<div class="reasons" style="color:var(--high)">${esc(i.error)}</div>` : ""}
-      <textarea id="body-${i.draft_id}" placeholder="Write a reply, pick an FAQ answer, or ask Claude for a draft">${esc(i.body)}</textarea>
-      <div class="actions">
-        ${i.status === "approved" ? `<button class="btn" onclick="saveDraft(${i.draft_id})">Save changes</button>`
-          : `<button class="btn primary" onclick="approveOne(${i.draft_id})">Approve</button>`}
-        <button class="btn" onclick="aiDraft(${i.draft_id}, this)">Draft with Claude</button>
-        <button class="btn ghost" onclick="toggleChat(${i.draft_id}, '${esc(i.conversation_id)}')">${state.openChat.has(i.draft_id) ? "Hide chat" : "Show chat"}</button>
-        <button class="btn ghost" onclick="rejectOne(${i.draft_id})">Dismiss</button>
-      </div>
-      ${chat}
-    </div>
-  </div>`;
-}
-
-function toggleSelect(id, on) { on ? state.selected.add(id) : state.selected.delete(id); renderQueue(); }
-function selectAll(on) { state.selected = new Set(on ? state.items.map((i) => i.draft_id) : []); renderQueue(); }
-
-async function toggleChat(id, conversationId) {
-  if (state.openChat.has(id)) { state.openChat.delete(id); renderQueue(); return; }
-  state.openChat.add(id); renderQueue();
-  const msgs = await api(`/api/conversations/${encodeURIComponent(conversationId)}`).catch(() => []);
-  const el = $(`chat-${id}`);
-  if (el) el.innerHTML = msgs.map((m) => `<div class="msg ${m.from}">${m.text ? esc(m.text) : '<span class="att">[attachment]</span>'}</div>`).join("") || "No messages stored.";
-}
-
-async function saveIfChanged(id) {
-  const item = state.items.find((i) => i.draft_id === id);
-  const body = $(`body-${id}`).value;
-  if (item && body.trim() !== (item.body || "").trim()) await api(`/api/drafts/${id}`, { method: "POST", body: { body } });
-}
-
-async function approveOne(id) {
-  try {
-    await saveIfChanged(id);
-    const r = await api("/api/drafts/approve", { method: "POST", body: { ids: [id] } });
-    if (r.refused[id]) toast(r.refused[id]);
-  } catch (e) { toast(e.message); }
-  load();
-}
-
-async function saveDraft(id) {
-  try { await saveIfChanged(id); toast("Saved - approve it again before sending."); } catch (e) { toast(e.message); }
-  load();
-}
-
-async function rejectOne(id) { await api("/api/drafts/reject", { method: "POST", body: { ids: [id] } }).catch((e) => toast(e.message)); load(); }
-
-async function aiDraft(id, btn) {
-  btn.disabled = true; btn.textContent = "Drafting…";
-  try { await api(`/api/drafts/${id}/ai`, { method: "POST" }); } catch (e) { toast(e.message); }
-  load();
-}
-
-async function bulkApprove() {
-  const ids = [...state.selected];
-  for (const id of ids) await saveIfChanged(id).catch(() => {});
-  const r = await api("/api/drafts/approve", { method: "POST", body: { ids } }).catch((e) => toast(e.message));
-  const refused = r ? Object.keys(r.refused).length : 0;
-  toast(`Approved ${ids.length - refused}` + (refused ? ` · ${refused} still need a reply written` : ""));
-  state.selected.clear(); load();
-}
-
-async function bulkApplyFaq(sel) {
-  if (!sel.value) return;
-  await api("/api/drafts/apply-faq", { method: "POST", body: { ids: [...state.selected], faq_key: sel.value } }).catch((e) => toast(e.message));
-  toast("FAQ answer filled in - review and approve.");
-  sel.value = ""; load();
-}
-
-async function bulkReject() {
-  await api("/api/drafts/reject", { method: "POST", body: { ids: [...state.selected] } }).catch((e) => toast(e.message));
-  state.selected.clear(); load();
-}
-
-async function approveFaqReplies() {
-  const p = filterParams(); p.delete("status");
-  const r = await api("/api/drafts/approve-faq?" + p, { method: "POST" }).catch((e) => toast(e.message));
-  if (r) toast(`Approved ${r.approved.length} FAQ replies. Check them, then press Send.`);
-  load();
-}
-
-function openSend() {
-  const items = state.items.filter((i) => i.status === "approved" && (!state.selected.size || state.selected.has(i.draft_id))).slice(0, 25);
-  if (!items.length) { toast("Nothing approved in this view."); return; }
-  $("send-title").textContent = `Send ${items.length} ${items.length === 1 ? "reply" : "replies"} on Instagram?`;
-  $("send-list").innerHTML = items.map((i) => `<div class="confirm-item"><b>@${esc(i.username)}</b> <span class="time">${hoursText(i.hours_left)}</span><div class="said">${esc(i.body)}</div></div>`).join("");
-  $("send-confirm").dataset.ids = JSON.stringify(items.map((i) => i.draft_id));
-  $("send-confirm").textContent = `Send ${items.length}`;
-  $("send-dialog").showModal();
-}
-
-async function confirmSend() {
-  const btn = $("send-confirm"); btn.disabled = true; btn.textContent = "Sending…";
-  try {
-    const r = await api("/api/drafts/send", { method: "POST", body: { ids: JSON.parse(btn.dataset.ids), confirm: true } });
-    const problems = [...Object.entries(r.blocked), ...Object.entries(r.failed)];
-    toast(`Sent ${r.sent.length}.` + (problems.length ? ` Not sent: ${problems.map(([, why]) => why).join("; ")}` : ""));
-  } catch (e) { toast(e.message); }
-  btn.disabled = false; $("send-dialog").close(); state.selected.clear(); load();
-}
-
-async function sync() {
-  try { await api("/api/sync", { method: "POST" }); toast("Checking Instagram for new messages…"); } catch (e) { toast(e.message); }
-  setTimeout(loadStats, 500);
-}
-
-function renderFaqs() {
-  $("faq-list").innerHTML = state.faqs.map((f) => `<div class="faq">
-    <div class="row"><h3>${esc(f.question)}</h3><span class="spacer"></span>
-      ${f.approved ? `<span class="pill ok">approved</span> <button class="btn ghost" onclick="setFaqApproved('${esc(f.key)}', false)">Unapprove</button>`
-        : `<button class="btn primary" onclick="setFaqApproved('${esc(f.key)}', true)">Approve</button>`}</div>
-    <div class="kw">Matches: ${esc(f.keywords.join(", "))}</div>
-    <textarea id="faq-${esc(f.key)}">${esc(f.answer)}</textarea>
-    <div class="actions"><button class="btn" onclick="saveFaq('${esc(f.key)}')">Save answer</button></div>
-  </div>`).join("") || `<div class="empty">No FAQs yet. Add them to faqs.json and restart.</div>`;
-}
-
-async function setFaqApproved(key, approved) {
-  await api(`/api/faqs/${encodeURIComponent(key)}`, { method: "POST", body: { approved } }).catch((e) => toast(e.message));
-  state.faqs = await api("/api/faqs"); renderFaqs(); load();
-}
-
-async function saveFaq(key) {
-  const answer = $(`faq-${key}`).value;
-  await api(`/api/faqs/${encodeURIComponent(key)}`, { method: "POST", body: { answer } }).catch((e) => toast(e.message));
-  toast("Saved - approve it again to use it in bulk.");
-  state.faqs = await api("/api/faqs"); renderFaqs(); load();
-}
-
-load();
-</script>
+<script src="/static/common.js"></script>
+<script src="/static/chat.js"></script>
+<script src="/static/sales.js"></script>
+<script src="/static/marketing.js"></script>
+<script src="/static/settings.js"></script>
+<script>go(location.hash.slice(1) || "chat");</script>
 </body>
 </html>

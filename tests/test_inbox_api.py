@@ -19,7 +19,9 @@ def client(inbox):
 def test_index_page_is_served(client):
     http, _ = client
     res = http.get("/")
-    assert res.status_code == 200 and "Custom Closet Inbox" in res.text
+    assert res.status_code == 200 and "Custom Closet" in res.text
+    for asset in ("app.css", "common.js", "chat.js", "sales.js", "marketing.js", "settings.js"):
+        assert http.get(f"/static/{asset}").status_code == 200
 
 
 def test_queue_and_filters(client):
@@ -72,3 +74,22 @@ def test_transcript_and_stats(client):
         "at": http.get("/api/conversations/c1").json()[0]["at"]}
     stats = http.get("/api/stats").json()
     assert stats["open"] == 2 and stats["sync"]["running"] is False
+
+
+def test_sales_marketing_and_settings_routes(client):
+    http, (db, *_rest) = client
+    funnel = http.get("/api/funnel", params={"days": 30}).json()
+    assert funnel["total"] == 2 and funnel["steps"][0]["stage"] == "new"
+    leads = http.get("/api/funnel/leads").json()
+    assert {l["username"] for l in leads} == {"fan", "buyer"}
+    assert http.post("/api/funnel/c1/stage", json={"stage": "quoted"}).status_code == 200
+    assert [l["username"] for l in http.get("/api/funnel/leads", params={"stage": "quoted"}).json()] == ["fan"]
+    assert http.post("/api/funnel/c1/stage", json={"stage": "bogus"}).status_code == 400
+    assert http.get("/api/funnel", params={"days": 1}).status_code == 422
+    assert http.get("/api/marketing").json()["sent"] == 0
+
+    assert http.post("/api/settings", json={"context_window_days": 10}).status_code == 200
+    settings = http.get("/api/settings").json()
+    assert settings["context_window_days"] == 10 and settings["archive"]["conversations"] == 2
+    assert http.post("/api/settings", json={"context_window_days": 0}).status_code == 422
+    assert http.post("/api/strategy/estimate", json={"question": "leaks?"}).status_code == 503   # no Claude

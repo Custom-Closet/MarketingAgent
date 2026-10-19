@@ -39,6 +39,20 @@ class DMDraft(BaseModel):
     message: str = Field(description="Instagram direct message text")
 
 
+class ConversationSummary(BaseModel):
+    summary: str = Field(description="Updated running summary, at most ~120 words, as short '- ' bullet lines")
+
+
+SUMMARY_PROMPT = """\
+Update the running summary of this Instagram conversation between the brand ("us") and a customer \
+("them"), folding in the newer messages below. Keep only what matters for replying later:
+- who they are (clothing brand or personal use, city/country if mentioned)
+- what they want (products, quantity, sizes, deadline, budget) and what they've sent (reference images, fabric)
+- what we told them (prices quoted with numbers, policies, timelines) and any objections
+- current status and the open next step
+Use at most ~120 words of short '- ' bullets. Leave out phone numbers, emails and street addresses."""
+
+
 def lead_context(lead: sqlite3.Row) -> str:
     keys = ("name", "position", "company", "domain", "website", "ig_username", "ig_bio", "ig_followers", "notes")
     return json.dumps({k: lead[k] for k in keys if lead[k]}, indent=2)
@@ -89,9 +103,16 @@ class Personalizer:
         prompt = f"Write a first Instagram DM to this account.\n\n<lead>\n{lead_context(lead)}\n</lead>"
         return self._parse(prompt, DMDraft)
 
-    def draft_dm_reply(self, username: str | None, inbound_text: str, *, history: str = "") -> DMDraft:
-        context = (f"<conversation_so_far>\n{history}\n</conversation_so_far>\n\n"
-                   "Don't repeat questions the conversation already answered.\n\n") if history else ""
+    def summarize_conversation(self, previous_summary: str, transcript: str) -> str:
+        prompt = (f"{SUMMARY_PROMPT}\n\n<previous_summary>\n{previous_summary or '(none yet)'}\n</previous_summary>"
+                  f"\n\n<newer_messages>\n{transcript}\n</newer_messages>")
+        return self._parse(prompt, ConversationSummary).summary
+
+    def draft_dm_reply(self, username: str | None, inbound_text: str, *, history: str = "",
+                       summary: str = "") -> DMDraft:
+        earlier = f"<earlier_in_this_chat>\n{summary}\n</earlier_in_this_chat>\n\n" if summary else ""
+        context = (f"{earlier}<recent_messages>\n{history}\n</recent_messages>\n\n"
+                   "Don't repeat questions the conversation already answered.\n\n") if history or summary else ""
         prompt = (
             f"@{username or 'someone'} messaged the brand on Instagram. Write a helpful reply that "
             "answers them and, if natural, moves toward a sale or next step.\n\n"

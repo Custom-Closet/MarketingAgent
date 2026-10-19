@@ -94,6 +94,28 @@ CREATE TABLE IF NOT EXISTS faqs (
     updated_at      TEXT NOT NULL
 );
 
+-- Compressed history of older messages, so Claude sees summary + recent window instead of the whole chat.
+CREATE TABLE IF NOT EXISTS ig_summaries (
+    conversation_id    TEXT PRIMARY KEY REFERENCES ig_conversations(id),
+    summary            TEXT NOT NULL,
+    summarized_through TEXT NOT NULL,  -- created_time of the newest message folded into the summary
+    updated_at         TEXT NOT NULL
+);
+
+-- Funnel stage set by hand in the Sales view; overrides the stage inferred from messages.
+CREATE TABLE IF NOT EXISTS funnel_overrides (
+    conversation_id TEXT PRIMARY KEY REFERENCES ig_conversations(id),
+    stage           TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+-- Small key/value settings edited in the app (e.g. context window days).
+CREATE TABLE IF NOT EXISTS app_settings (
+    key             TEXT PRIMARY KEY,
+    value           TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS suppression (
     value           TEXT PRIMARY KEY,  -- email address or IG username, lower-cased
     reason          TEXT,
@@ -377,6 +399,53 @@ class Database:
         return self.conn.execute(
             """SELECT c.* FROM ig_conversations c WHERE EXISTS (SELECT 1 FROM ig_messages m
                    WHERE m.conversation_id = c.id AND m.created_time >= ?) ORDER BY c.updated_time DESC""",
+            (since.astimezone(timezone.utc).isoformat(timespec="seconds"),)).fetchall()
+
+    # ---- summaries, funnel overrides, settings ----------------------------------
+
+    def ig_summary(self, conversation_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM ig_summaries WHERE conversation_id = ?",
+                                 (conversation_id,)).fetchone()
+
+    def save_ig_summary(self, conversation_id: str, summary: str, summarized_through: str) -> None:
+        self.conn.execute(
+            """INSERT INTO ig_summaries (conversation_id, summary, summarized_through, updated_at) VALUES (?, ?, ?, ?)
+               ON CONFLICT (conversation_id) DO UPDATE SET summary = excluded.summary,
+                   summarized_through = excluded.summarized_through, updated_at = excluded.updated_at""",
+            (conversation_id, summary, summarized_through, now_iso()))
+        self.conn.commit()
+
+    def funnel_overrides(self) -> dict[str, str]:
+        return {r["conversation_id"]: r["stage"] for r in self.conn.execute("SELECT * FROM funnel_overrides")}
+
+    def set_funnel_override(self, conversation_id: str, stage: str | None) -> None:
+        if stage is None:
+            self.conn.execute("DELETE FROM funnel_overrides WHERE conversation_id = ?", (conversation_id,))
+        else:
+            self.conn.execute(
+                """INSERT INTO funnel_overrides (conversation_id, stage, updated_at) VALUES (?, ?, ?)
+                   ON CONFLICT (conversation_id) DO UPDATE SET stage = excluded.stage, updated_at = excluded.updated_at""",
+                (conversation_id, stage, now_iso()))
+        self.conn.commit()
+
+    def setting(self, key: str, default: str | None = None) -> str | None:
+        row = self.conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.conn.execute(
+            """INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
+            (key, value, now_iso()))
+        self.conn.commit()
+
+    def ig_messages_since(self, since: datetime) -> list[sqlite3.Row]:
+        """All archived messages of conversations active since `since`, grouped by conversation, oldest first."""
+        return self.conn.execute(
+            """SELECT m.*, c.username FROM ig_messages m JOIN ig_conversations c ON c.id = m.conversation_id
+               WHERE m.conversation_id IN (SELECT conversation_id FROM ig_messages GROUP BY conversation_id
+                                           HAVING MAX(created_time) >= ?)
+               ORDER BY m.conversation_id, m.created_time""",
             (since.astimezone(timezone.utc).isoformat(timespec="seconds"),)).fetchall()
 
     # ---- suppression -----------------------------------------------------

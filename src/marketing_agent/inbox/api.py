@@ -6,8 +6,10 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
+from ..insights.service import InsightsService
 from .service import InboxService, QueueFilters, SendNotConfirmed
 
 STATIC = Path(__file__).parent / "static"
@@ -37,6 +39,27 @@ class FaqUpdate(BaseModel):
     approved: bool | None = None
 
 
+class StageUpdate(BaseModel):
+    stage: str | None = None          # None = back to the inferred stage
+
+
+class Turn(BaseModel):
+    role: str = Field(pattern="^(user|assistant)$")
+    content: str
+
+
+class StrategyRequest(BaseModel):
+    question: str
+    history: list[Turn] = []
+    days: int = Field(90, ge=7, le=365)
+    confirm: bool = False
+
+
+class SettingsUpdate(BaseModel):
+    context_window_days: int | None = Field(None, ge=1, le=60)
+    lost_after_days: int | None = Field(None, ge=3, le=120)
+
+
 def _filters(priority: str | None, category: str | None, customer_type: str | None, status: str | None,
              max_hours_left: float | None, q: str | None) -> QueueFilters:
     return QueueFilters(priority=set(priority.split(",")) if priority else None, category=category or None,
@@ -44,8 +67,10 @@ def _filters(priority: str | None, category: str | None, customer_type: str | No
                         max_hours_left=max_hours_left, search=q or None)
 
 
-def create_app(service: InboxService) -> FastAPI:
-    app = FastAPI(title="Custom Closet inbox", docs_url="/api/docs")
+def create_app(service: InboxService, insights: InsightsService | None = None) -> FastAPI:
+    app = FastAPI(title="Custom Closet", docs_url="/api/docs")
+    insights = insights or InsightsService(service.repo.db, our_id=service.our_id, lock=service.lock)
+    app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
     def guard(fn, *args, **kwargs):
         try:
@@ -126,6 +151,64 @@ def create_app(service: InboxService) -> FastAPI:
             guard(service.edit_faq, key, req.answer, req.keywords)
         if req.approved is not None:
             guard(service.approve_faq, key, req.approved)
+        return {"ok": True}
+
+    # ---- sales ------------------------------------------------------------------------
+
+    @app.get("/api/funnel")
+    def funnel(days: int = Query(90, ge=7, le=365), segment: str | None = None, source: str | None = None):
+        return insights.funnel(days=days, segment=segment or None, source=source or None)
+
+    @app.get("/api/funnel/leads")
+    def funnel_leads(days: int = Query(90, ge=7, le=365), stage: str | None = None, reason: str | None = None,
+                     segment: str | None = None, source: str | None = None, q: str | None = None):
+        return insights.leads(days=days, stage=stage or None, reason=reason or None, segment=segment or None,
+                              source=source or None, search=q or None)
+
+    @app.post("/api/funnel/{conversation_id}/stage")
+    def set_stage(conversation_id: str, req: StageUpdate):
+        guard(insights.set_stage, conversation_id, req.stage)
+        return {"ok": True}
+
+    @app.post("/api/strategy/estimate")
+    def strategy_estimate(req: StrategyRequest):
+        return guard(insights.strategy_estimate, req.question, [t.model_dump() for t in req.history], days=req.days)
+
+    @app.post("/api/strategy")
+    def strategy(req: StrategyRequest):
+        answer = guard(insights.strategy, req.question, [t.model_dump() for t in req.history],
+                       confirm=req.confirm, days=req.days)
+        return {"answer": answer}
+
+    # ---- marketing ----------------------------------------------------------------------
+
+    @app.get("/api/marketing")
+    def marketing(days: int = Query(90, ge=7, le=365)):
+        return insights.marketing(days=days)
+
+    # ---- settings -------------------------------------------------------------------------
+
+    @app.get("/api/settings")
+    def settings():
+        db = service.repo.db
+        counts = db.conn.execute("SELECT (SELECT COUNT(*) FROM ig_conversations), (SELECT COUNT(*) FROM ig_messages), "
+                                 "(SELECT MAX(created_time) FROM ig_messages), (SELECT COUNT(*) FROM ig_summaries)").fetchone()
+        return {
+            "context_window_days": service.window_days(),
+            "lost_after_days": insights.lost_after_days(),
+            "status": {"instagram": service.ig is not None, "claude_drafts": service.writer is not None,
+                       "strategist": insights.strategist is not None, "sync": dict(service.sync_state)},
+            "archive": {"conversations": counts[0], "messages": counts[1], "newest_message": counts[2],
+                        "summaries": counts[3]},
+        }
+
+    @app.post("/api/settings")
+    def update_settings(req: SettingsUpdate):
+        with service.lock:
+            if req.context_window_days is not None:
+                service.repo.db.set_setting("context_window_days", str(req.context_window_days))
+            if req.lost_after_days is not None:
+                service.repo.db.set_setting("lost_after_days", str(req.lost_after_days))
         return {"ok": True}
 
     return app

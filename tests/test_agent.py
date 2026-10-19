@@ -438,7 +438,7 @@ def test_sync_instagram_drafts_with_conversation_history(db):
                                    conversation_id="c1")]
 
     class Writer:
-        def draft_dm_reply(self, username, inbound_text, *, history=""):
+        def draft_dm_reply(self, username, inbound_text, *, history="", summary=""):
             self.history = history
             from marketing_agent.personalize import DMDraft
             return DMDraft(message="It depends on the fabric - could you share a reference image?")

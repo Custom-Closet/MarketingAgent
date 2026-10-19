@@ -233,7 +233,7 @@ def test_ai_draft_uses_conversation_history(inbox):
     db, repo, _, ig = inbox
 
     class Writer:
-        def draft_dm_reply(self, username, inbound_text, *, history=""):
+        def draft_dm_reply(self, username, inbound_text, *, history="", summary=""):
             self.args = (username, inbound_text, history)
             from marketing_agent.personalize import DMDraft
             return DMDraft(message="Lovely! Could you share the reference image?")

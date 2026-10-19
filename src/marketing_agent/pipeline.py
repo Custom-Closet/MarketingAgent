@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from .channels.gmail import GmailChannel, build_email
 from .config import Settings
+from .context import DEFAULT_WINDOW_DAYS, build_context, format_messages
 from .db import Database
 from .personalize import Personalizer
 from .sources.hunter import HunterClient, HunterError
@@ -305,7 +306,6 @@ def sync_gmail(db: Database, gmail: GmailChannel, *, replies: list[tuple[str, st
     return stats
 
 
-TRANSCRIPT_FOR_DRAFTS = 30          # newest stored messages Claude sees when drafting a reply
 ARCHIVE_WINDOW = timedelta(days=90)  # how far back a conversation's history is fetched
 
 
@@ -357,12 +357,7 @@ def archive_instagram(db: Database, ig: InstagramClient, *, since: datetime, sta
 
 def transcript_text(db: Database, conversation_id: str, ig_user_id: str, limit: int | None = None) -> str:
     """Stored conversation as 'them:' / 'us:' lines, oldest first."""
-    lines = []
-    for m in db.ig_transcript(conversation_id, limit=limit):
-        who = "us" if m["from_id"] == ig_user_id else "them"
-        text = m["text"] or ("<sent an image/attachment>" if m["extras_json"] else "<no text>")
-        lines.append(f"[{m['created_time'][:16]}] {who}: {text}")
-    return "\n".join(lines)
+    return format_messages(db.ig_transcript(conversation_id, limit=limit), ig_user_id)
 
 
 def sync_instagram(db: Database, ig: InstagramClient, writer: Personalizer, *, log: Log = print) -> int:
@@ -387,9 +382,12 @@ def sync_instagram(db: Database, ig: InstagramClient, writer: Personalizer, *, l
         ).fetchone()
         if already:
             continue
-        history = (transcript_text(db, convo.conversation_id, ig.ig_user_id, limit=TRANSCRIPT_FOR_DRAFTS)
-                   if convo.conversation_id else "")
-        reply = writer.draft_dm_reply(convo.username, convo.last_inbound_text, history=history)
+        ctx = (build_context(db, convo.conversation_id, ig.ig_user_id,
+                             summarizer=getattr(writer, "summarize_conversation", None),
+                             window_days=int(db.setting("context_window_days", str(DEFAULT_WINDOW_DAYS))))
+               if convo.conversation_id else None)
+        reply = writer.draft_dm_reply(convo.username, convo.last_inbound_text,
+                                      history=ctx.recent if ctx else "", summary=ctx.summary if ctx else "")
         db.add_message(lead_id, "instagram", reply.message, kind="reply", thread_id=convo.recipient_id,
                        reply_deadline=(convo.last_inbound_at + REPLY_WINDOW).isoformat(timespec="seconds"))
         hours_left = (REPLY_WINDOW - (datetime.now(timezone.utc) - convo.last_inbound_at)).total_seconds() / 3600

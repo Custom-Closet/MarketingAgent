@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from .. import pipeline
+from ..context import DEFAULT_WINDOW_DAYS, build_context
 from ..sources.instagram import REPLY_WINDOW, InstagramError, InstagramRateLimited, parse_time
 from .faq import FAQ, match_faq
 from .repository import InboxRepository
@@ -122,6 +123,12 @@ class InboxService:
         self.clock = clock
         self.lock = threading.RLock()       # one SQLite connection shared by the web server's threads
         self.sync_state = {"running": False, "last_finished": None, "last_error": None, "conversations": 0}
+
+    # ---- settings -----------------------------------------------------------------
+
+    def window_days(self) -> int:
+        """Days of recent messages Claude sees verbatim; older ones are summarised."""
+        return int(self.repo.db.setting("context_window_days", str(DEFAULT_WINDOW_DAYS)))
 
     # ---- FAQ library ----------------------------------------------------------
 
@@ -353,10 +360,10 @@ class InboxService:
             draft = self._open_draft(draft_id)
             cid = draft["conversation_id"]
             texts = [m["text"] for m in self.repo.unanswered_messages(cid, self.our_id) if m["text"]] if cid else []
-            history = pipeline.transcript_text(self.repo.db, cid, self.our_id,
-                                               limit=pipeline.TRANSCRIPT_FOR_DRAFTS) if cid else ""
+            ctx = build_context(self.repo.db, cid, self.our_id, window_days=self.window_days(),
+                                summarizer=getattr(self.writer, "summarize_conversation", None)) if cid else None
         reply = self.writer.draft_dm_reply(draft["ig_username"], " ".join(texts) or "(sent an attachment)",
-                                           history=history)
+                                           history=ctx.recent if ctx else "", summary=ctx.summary if ctx else "")
         self.edit(draft_id, reply.message)
         return reply.message
 

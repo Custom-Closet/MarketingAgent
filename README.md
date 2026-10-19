@@ -140,6 +140,23 @@ uv run agent serve               # opens http://localhost:8000
 Nothing is ever sent without approval and that final confirmation. `agent serve` uses the local
 database (`AGENT_DB_PATH`); it refuses to start when `AGENT_DB_S3_URI` is set.
 
+The sidebar has four modules:
+
+- **Chat** - the reply inbox above.
+- **Sales** - the funnel built from the DM archive: New → Engaged → Qualified → Quoted →
+  Sample/Order → Won, with lost leads and why they were lost (we didn't reply, never sent a
+  reference, fabric must be provided, price, out of scope, went quiet), lead sources, weekly volume
+  and reply times. Stages are inferred by rules (no API cost); drag a card to correct one. **Ask the
+  strategist** sends the funnel numbers and a few anonymised lost chats to Claude after showing the
+  estimated cost (about $0.07 per question).
+- **Marketing** - reply rates per outreach message (other brands' instant auto-replies excluded)
+  and how each lead source converts.
+- **Settings** - status, FAQ answers, the lost-after window and the drafting context window.
+
+**Drafting context.** All raw messages stay in the database. When Claude drafts a reply it sees the
+last N days of the chat word for word (Settings, default 7) plus a short summary of everything
+older, which is updated incrementally and stored per conversation (`ig_summaries`).
+
 ## Daily run on AWS Lambda
 
 Every morning at **08:00 India time**, EventBridge Scheduler starts a Lambda function that runs the
