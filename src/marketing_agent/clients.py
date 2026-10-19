@@ -31,15 +31,32 @@ def instagram_client(settings: Settings):
                            api_version=settings.graph_api_version)
 
 
-def claude_configured() -> bool:
-    """True when the Anthropic SDK has credentials to use (API key or auth token in the environment/.env)."""
+def llm_configured(settings: Settings) -> bool:
+    """True when the configured model backend has credentials (see llm.py)."""
     import os
+    if settings.llm_provider == "bedrock":
+        aws_keys = os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY")
+        return bool(settings.bedrock_model_id and settings.bedrock_region
+                    and (settings.bedrock_api_key or aws_keys or os.environ.get("AWS_PROFILE")))
     return bool(os.environ.get("ANTHROPIC_API_KEY", "").strip() or os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip())
+
+
+def llm(settings: Settings):
+    from .llm import build_llm
+    return build_llm(provider=settings.llm_provider, anthropic_model=settings.anthropic_model,
+                     effort=settings.anthropic_effort, bedrock_model=settings.bedrock_model_id,
+                     bedrock_region=settings.bedrock_region, bedrock_api_key=settings.bedrock_api_key)
+
+
+def describe_llm(settings: Settings) -> str:
+    if settings.llm_provider == "bedrock":
+        return f"Bedrock {settings.bedrock_model_id} ({settings.bedrock_region})"
+    return f"Claude API {settings.anthropic_model}"
 
 
 def writer(settings: Settings):
     from .personalize import Personalizer
-    return Personalizer(settings.brand_file, model=settings.anthropic_model, effort=settings.anthropic_effort)
+    return Personalizer(settings.brand_file, llm=llm(settings))
 
 
 def build_clients(settings: Settings, *, interactive: bool) -> dict[str, Any]:

@@ -187,7 +187,8 @@ def test_personalizer_request_shape(db, tmp_path):
     client = anthropic.Anthropic(api_key="test", http_client=httpx2.Client(transport=httpx2.MockTransport(handler)))
     brand = tmp_path / "brand.md"
     brand.write_text("We sell oat milk to cafes.")
-    writer = Personalizer(brand, model="claude-opus-5-5", effort="medium", client=client)
+    from marketing_agent.llm import ClaudeLLM
+    writer = Personalizer(brand, llm=ClaudeLLM(client, "claude-opus-5-5", "medium"))
 
     lead_id = db.upsert_lead(name="Jo Li", email="jo@acme.com", company="Acme", source="test")
     draft = writer.draft_email(db.get_lead(lead_id))
@@ -495,36 +496,29 @@ def test_archive_continues_past_an_unreadable_conversation(db):
 
 # ---- brand builder ------------------------------------------------------------
 
-class FakeAnthropic:
-    """Just enough of the Anthropic client for BrandBuilder."""
+class FakeLLM:
+    """Stands in for llm.LLM: records prompts, returns canned findings and a canned profile."""
+
+    model = "fake"
 
     def __init__(self, merge_text="# Brand profile\n\n## FAQ\n- MOQ? 30 pieces (seen in 2 chats)"):
-        from types import SimpleNamespace as NS
-        from marketing_agent.brand_builder import BatchFindings, FAQ
-        self.prompts, outer = [], self
+        self.prompts, self.merge_text = [], merge_text
 
-        class Stream:
-            def __enter__(self):
-                return self
+    def parse(self, *, system, prompt, schema, max_tokens=16000):
+        from marketing_agent.brand_builder import FAQ, BatchFindings
+        self.prompts.append(prompt)
+        return BatchFindings(faqs=[FAQ(question="MOQ?", answer_given="30 pieces", chats=2)], facts=[], objections=[],
+                             conversion_signals=[], winning_replies=[], tone_notes=[])
 
-            def __exit__(self, *exc):
-                return False
+    def text(self, *, system, messages, max_tokens=16000, long=False):
+        self.prompts.append(messages[-1]["content"])
+        return self.merge_text
 
-            def get_final_message(self):
-                return NS(stop_reason="end_turn", content=[NS(type="thinking"), NS(type="text", text=merge_text)])
+    def count_tokens(self, *, system, prompt):
+        return len(prompt) // 4
 
-        def parse(**kw):
-            outer.prompts.append(kw["messages"][0]["content"])
-            return NS(stop_reason="end_turn", parsed_output=BatchFindings(
-                faqs=[FAQ(question="MOQ?", answer_given="30 pieces", chats=2)], facts=[], objections=[],
-                conversion_signals=[], winning_replies=[], tone_notes=[]))
-
-        def stream(**kw):
-            outer.prompts.append(kw["messages"][0]["content"])
-            return Stream()
-
-        self.messages = NS(count_tokens=lambda **kw: NS(input_tokens=len(kw["messages"][0]["content"]) // 4))
-        self.beta = NS(messages=NS(parse=parse, stream=stream))
+    def price(self):
+        return (4.0, 20.0)
 
 
 def _seed_chat(db, cid, username, lines):
@@ -542,8 +536,8 @@ def test_brand_builder_batches_chats_and_merges(db, tmp_path, monkeypatch):
     brand = tmp_path / "brand.md"
     brand.write_text("# Brand profile\n\n## Who we are\nCustom Closet")
 
-    client = FakeAnthropic()
-    builder = BrandBuilder(brand, model="claude-opus-5-5", effort="medium", client=client)
+    client = FakeLLM()
+    builder = BrandBuilder(brand, llm=client)
     plan = builder.plan(db, "1784", datetime.now(timezone.utc) - timedelta(days=90))
     assert plan.chats == 3 and len(plan.batches) == 2 and plan.est_cost_usd > 0
     assert "ghost" not in "".join(plan.batches)
@@ -558,8 +552,7 @@ def test_brand_builder_batches_chats_and_merges(db, tmp_path, monkeypatch):
 
 def test_brand_builder_rejects_non_markdown_merge(tmp_path):
     from marketing_agent.brand_builder import BrandBuilder
-    builder = BrandBuilder(tmp_path / "missing.md", model="claude-opus-5-5", effort="medium",
-                           client=FakeAnthropic(merge_text="Sure! Here is your profile..."))
+    builder = BrandBuilder(tmp_path / "missing.md", llm=FakeLLM(merge_text="Sure! Here is your profile..."))
     with pytest.raises(RuntimeError, match="Markdown heading"):
         builder.merge([], chats=1)
 
@@ -575,12 +568,35 @@ def test_build_brand_cli_refuses_to_overwrite_brand_md(tmp_path, monkeypatch):
     assert result.exit_code != 0 and "must not be brand.md" in result.output
 
 
-def test_claude_configured_reads_key_from_environment(monkeypatch):
+def test_llm_configured_per_provider(monkeypatch, settings):
+    from dataclasses import replace
+
     from marketing_agent import clients
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
-    assert not clients.claude_configured()
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "  ")
-    assert not clients.claude_configured()
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE"):
+        monkeypatch.delenv(var, raising=False)
+    anthropic_settings = replace(settings, llm_provider="anthropic")
+    assert not clients.llm_configured(anthropic_settings)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-    assert clients.claude_configured()
+    assert clients.llm_configured(anthropic_settings)
+
+    bedrock = replace(settings, llm_provider="bedrock", bedrock_model_id="openai.gpt-5.5", bedrock_region="ap-south-1",
+                      bedrock_api_key="")
+    assert not clients.llm_configured(bedrock)
+    assert clients.llm_configured(replace(bedrock, bedrock_api_key="bedrock-key"))
+    assert not clients.llm_configured(replace(bedrock, bedrock_api_key="bedrock-key", bedrock_region=""))
+
+
+def test_llm_provider_auto_detection(monkeypatch):
+    from marketing_agent.config import _llm_provider
+    for var in ("LLM_PROVIDER", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "BEDROCK_MODEL_ID"):
+        monkeypatch.delenv(var, raising=False)
+    assert _llm_provider() == "anthropic"
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "openai.gpt-5.5")
+    assert _llm_provider() == "bedrock"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    assert _llm_provider() == "anthropic"                     # a Claude API key wins unless told otherwise
+    monkeypatch.setenv("LLM_PROVIDER", "Bedrock")
+    assert _llm_provider() == "bedrock"
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    with pytest.raises(ValueError):
+        _llm_provider()

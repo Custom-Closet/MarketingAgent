@@ -132,6 +132,7 @@ def push_secrets(secret_id: str = typer.Option("marketing-agent/secrets", help="
     if not settings.gmail_token_file.exists():
         raise typer.BadParameter("Run `agent auth-gmail` first")
     values = {"ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", ""),
+              "AWS_BEARER_TOKEN_BEDROCK": settings.bedrock_api_key,
               "HUNTER_API_KEY": settings.hunter_api_key,
               "IG_ACCESS_TOKEN": settings.ig_access_token,
               "GMAIL_TOKEN_JSON": settings.gmail_token_file.read_text()}
@@ -373,15 +374,17 @@ def build_brand(
     out = out or settings.brand_file.with_name("brand.draft.md")
     if out.resolve() == settings.brand_file.resolve():
         raise typer.BadParameter("--out must not be brand.md itself; review the draft and rename it yourself")
-    builder = BrandBuilder(settings.brand_file, model=settings.anthropic_model, effort=settings.anthropic_effort)
+    if not clients.llm_configured(settings):
+        raise typer.BadParameter("No model configured - set ANTHROPIC_API_KEY, or LLM_PROVIDER=bedrock with BEDROCK_* in .env")
+    builder = BrandBuilder(settings.brand_file, llm=clients.llm(settings))
     plan = builder.plan(db, settings.ig_user_id, datetime.now(timezone.utc) - timedelta(days=days))
     if not plan.chats:
         _log("No archived conversations in that period. Run `agent ig-archive` first.")
         raise typer.Exit(1)
-    cost = f"~${plan.est_cost_usd:.2f}" if plan.est_cost_usd is not None else "unknown (model not in price table)"
+    cost = f"~${plan.est_cost_usd:.2f}" if plan.est_cost_usd is not None else "billed by AWS (see Bedrock pricing)"
     _log(f"{plan.chats} conversations in {len(plan.batches)} batches, {plan.input_tokens:,} transcript tokens, "
-         f"{settings.anthropic_model}: estimated cost {cost}.")
-    if not yes and not typer.confirm("Send these conversations to Claude and draft the profile?", default=False):
+         f"{clients.describe_llm(settings)}: estimated cost {cost}.")
+    if not yes and not typer.confirm("Send these conversations to the model and draft the profile?", default=False):
         raise typer.Exit()
     out.write_text(builder.build(plan, log=_log))
     _log(f"Draft written to {out}. Review it - especially '## Needs confirmation' - then replace {settings.brand_file}.")
@@ -412,11 +415,14 @@ def serve(
     repo = InboxRepository(db)
     added = repo.seed_faqs(load_faq_file(settings.faq_file))
     writer = None
-    if not clients.claude_configured():
-        _log("[yellow]ANTHROPIC_API_KEY is not set in .env - 'Draft with Claude' and the strategist are off.[/yellow]")
+    if not clients.llm_configured(settings):
+        missing = ("BEDROCK_MODEL_ID / BEDROCK_REGION / AWS_BEARER_TOKEN_BEDROCK" if settings.llm_provider == "bedrock"
+                   else "ANTHROPIC_API_KEY")
+        _log(f"[yellow]{missing} not set in .env - 'Draft with Claude' and the strategist are off.[/yellow]")
     else:
         try:
             writer = clients.writer(settings)
+            _log(f"Drafting with {clients.describe_llm(settings)}")
         except FileNotFoundError:
             _log("[yellow]brand.md not found - 'Draft with Claude' and the strategist are off.[/yellow]")
     service = InboxService(repo, our_id=settings.ig_user_id, ig=clients.instagram_client(settings), writer=writer)
@@ -424,8 +430,7 @@ def serve(
     strategist = None
     if writer is not None:
         from .insights.strategist import Strategist
-        strategist = Strategist(settings.brand_file.read_text(), model=settings.anthropic_model,
-                                effort=settings.anthropic_effort, client=writer.client)
+        strategist = Strategist(settings.brand_file.read_text(), llm=writer.llm)
     insights = InsightsService(db, our_id=settings.ig_user_id, lock=service.lock, strategist=strategist)
     url = f"http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}"
     _log(f"Inbox at {url}  ({added} new FAQs loaded from {settings.faq_file}). Ctrl+C to stop.")

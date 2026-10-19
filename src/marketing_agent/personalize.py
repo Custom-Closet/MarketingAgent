@@ -6,8 +6,9 @@ import json
 import sqlite3
 from pathlib import Path
 
-import anthropic
 from pydantic import BaseModel, Field
+
+from .llm import LLM
 
 SYSTEM_PROMPT = """\
 You write outreach on behalf of the brand described below. Every message goes to a real \
@@ -59,32 +60,14 @@ def lead_context(lead: sqlite3.Row) -> str:
 
 
 class Personalizer:
-    def __init__(self, brand_file: Path, *, model: str, effort: str, client: anthropic.Anthropic | None = None):
+    def __init__(self, brand_file: Path, *, llm: LLM):
         if not brand_file.exists():
             raise FileNotFoundError(f"{brand_file} not found. Run `agent init` and describe your brand there.")
         self.system = SYSTEM_PROMPT.format(brand=brand_file.read_text().strip())
-        self.model = model
-        self.effort = effort
-        self.client = client or anthropic.Anthropic()
+        self.llm = llm
 
     def _parse(self, prompt: str, output_format: type[BaseModel]) -> BaseModel:
-        response = self.client.beta.messages.parse(
-            model=self.model,
-            max_tokens=16000,
-            # Brand system prompt is identical across every lead, so cache it.
-            system=[{"type": "text", "text": self.system, "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": prompt}],
-            output_config={"effort": self.effort},
-            output_format=output_format,
-            # Re-run on a fallback model if a safety classifier declines the request.
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-        )
-        if response.stop_reason == "refusal":
-            raise RuntimeError("Claude declined to draft this message")
-        if response.parsed_output is None:
-            raise RuntimeError(f"Could not parse draft (stop_reason={response.stop_reason})")
-        return response.parsed_output
+        return self.llm.parse(system=self.system, prompt=prompt, schema=output_format)
 
     def draft_email(self, lead: sqlite3.Row) -> EmailDraft:
         prompt = f"Write a first cold email to this lead.\n\n<lead>\n{lead_context(lead)}\n</lead>"

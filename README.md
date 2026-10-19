@@ -51,6 +51,24 @@ gitignored; `brand.example.md` is the committed template. After that, add creden
 Create a key at [console.anthropic.com](https://console.anthropic.com) and set `ANTHROPIC_API_KEY`.
 The default model is `claude-opus-5-5` at `medium` effort. Change it with `ANTHROPIC_MODEL` / `ANTHROPIC_EFFORT`.
 
+**Or use Amazon Bedrock** (any model your AWS account has access to):
+
+```bash
+LLM_PROVIDER=bedrock                              # auto-selected if BEDROCK_MODEL_ID is set and ANTHROPIC_API_KEY isn't
+BEDROCK_MODEL_ID=global.anthropic.claude-opus-5-5 # or e.g. global.openai.gpt-5.5; use an inference-profile ID if
+                                                  # the plain model ID isn't offered in your region
+BEDROCK_REGION=ap-south-1                         # defaults to AWS_REGION
+AWS_BEARER_TOKEN_BEDROCK=...                      # Bedrock API key
+```
+
+- Claude models with `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` set use the Anthropic SDK's Bedrock
+  client (SigV4) - structured outputs and prompt caching as on the Claude API.
+- Any other model, or Claude with only a Bedrock API key, goes through the Bedrock Converse API; replies
+  are requested as JSON and validated, with one retry.
+- Enable the model first under **Bedrock console → Model access** in that region. "is not available for
+  this account" means access hasn't been granted yet. Costs are billed by AWS, so the app shows token
+  estimates instead of dollar amounts.
+
 ### 2. Hunter.io
 Copy your key from [hunter.io/api-keys](https://hunter.io/api-keys) into `HUNTER_API_KEY`.
 Each domain search uses one search credit and each verification uses one verification credit.
@@ -124,6 +142,11 @@ uv run agent status
 ```bash
 cp faqs.example.json faqs.json   # then write your real FAQ answers (faqs.json is gitignored)
 uv run agent serve               # opens http://localhost:8000
+
+cd /Users/karthikmac/Documents/Code/MinimiseLovable/MarketingAgent
+git checkout feature/sales-app          # the inbox lives on this branch
+PYTHONPATH=src uv run --no-sync python -m marketing_agent.cli serve
+
 ```
 
 1. **Check for new messages** reads chats from the last 23 hours (read-only, rate-limited) and

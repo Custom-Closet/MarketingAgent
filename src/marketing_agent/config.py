@@ -29,9 +29,13 @@ class Settings:
     brand_file: Path
     faq_file: Path          # seed answers for the inbox (faqs.json, gitignored)
 
-    # Claude
+    # Language model (see llm.py): Claude API, or any model on Amazon Bedrock
+    llm_provider: str       # "anthropic" or "bedrock"
     anthropic_model: str
     anthropic_effort: str
+    bedrock_model_id: str   # e.g. anthropic.claude-opus-5-5 or openai.gpt-5.5
+    bedrock_region: str
+    bedrock_api_key: str    # AWS_BEARER_TOKEN_BEDROCK (Bedrock-scoped API key)
 
     # Hunter.io
     hunter_api_key: str
@@ -69,6 +73,17 @@ class Settings:
         return bool(self.ig_access_token and self.ig_user_id)
 
 
+def _llm_provider() -> str:
+    """LLM_PROVIDER if set; otherwise Bedrock when a Bedrock model is configured and no Claude API key is."""
+    explicit = _env("LLM_PROVIDER").lower()
+    if explicit:
+        if explicit not in ("anthropic", "bedrock"):
+            raise ValueError("LLM_PROVIDER must be 'anthropic' or 'bedrock'")
+        return explicit
+    has_claude_key = bool(_env("ANTHROPIC_API_KEY") or _env("ANTHROPIC_AUTH_TOKEN"))
+    return "bedrock" if _env("BEDROCK_MODEL_ID") and not has_claude_key else "anthropic"
+
+
 def load_settings() -> Settings:
     data_dir = Path(_env("AGENT_DATA_DIR", "data"))
     return Settings(
@@ -77,8 +92,12 @@ def load_settings() -> Settings:
         db_s3_uri=_env("AGENT_DB_S3_URI"),
         brand_file=Path(_env("BRAND_FILE", "brand.md")),
         faq_file=Path(_env("FAQ_FILE", "faqs.json")),
+        llm_provider=_llm_provider(),
         anthropic_model=_env("ANTHROPIC_MODEL", "claude-opus-5-5"),
         anthropic_effort=_env("ANTHROPIC_EFFORT", "medium"),
+        bedrock_model_id=_env("BEDROCK_MODEL_ID"),
+        bedrock_region=_env("BEDROCK_REGION") or _env("AWS_REGION") or _env("AWS_DEFAULT_REGION"),
+        bedrock_api_key=_env("AWS_BEARER_TOKEN_BEDROCK"),
         hunter_api_key=_env("HUNTER_API_KEY"),
         gmail_credentials_file=Path(_env("GMAIL_CREDENTIALS_FILE", "credentials.json")),
         gmail_token_file=Path(_env("GMAIL_TOKEN_FILE", str(data_dir / "gmail_token.json"))),

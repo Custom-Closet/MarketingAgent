@@ -8,7 +8,7 @@ import time
 from datetime import timedelta
 
 # Keys allowed to come from the Secrets Manager secret (see `agent push-secrets`).
-SECRET_KEYS = ("ANTHROPIC_API_KEY", "HUNTER_API_KEY", "IG_ACCESS_TOKEN", "GMAIL_TOKEN_JSON")
+SECRET_KEYS = ("ANTHROPIC_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "HUNTER_API_KEY", "IG_ACCESS_TOKEN", "GMAIL_TOKEN_JSON")
 
 # Leave room after the deadline for the database upload and the digest.
 SAFETY_MARGIN_SECONDS = 90

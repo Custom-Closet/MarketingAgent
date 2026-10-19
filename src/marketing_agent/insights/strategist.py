@@ -10,9 +10,8 @@ import json
 import re
 from dataclasses import dataclass
 
-import anthropic
+from ..llm import LLM
 
-PRICE_PER_MTOK = {"claude-opus-5-5": (4.0, 20.0)}   # USD (input, output)
 EST_OUTPUT_TOKENS = 2_500
 
 SYSTEM = """\
@@ -49,11 +48,9 @@ class Estimate:
 
 
 class Strategist:
-    def __init__(self, brand_text: str, *, model: str, effort: str, client: anthropic.Anthropic | None = None):
+    def __init__(self, brand_text: str, *, llm: LLM):
         self.system = SYSTEM.format(brand=brand_text.strip() or "(no brand profile yet)")
-        self.model = model
-        self.effort = effort
-        self.client = client or anthropic.Anthropic()
+        self.llm = llm
 
     @staticmethod
     def briefing(report: dict, outreach: dict, examples: list[dict]) -> str:
@@ -66,7 +63,7 @@ class Strategist:
     def estimate(self, briefing: str, question: str, history: list[dict]) -> Estimate:
         chars = len(self.system) + len(briefing) + len(question) + sum(len(m["content"]) for m in history)
         tokens = chars // 4
-        price = PRICE_PER_MTOK.get(self.model)
+        price = self.llm.price()
         usd = round((tokens * price[0] + EST_OUTPUT_TOKENS * price[1]) / 1_000_000, 3) if price else None
         return Estimate(input_tokens=tokens, output_tokens=EST_OUTPUT_TOKENS, usd=usd)
 
@@ -74,15 +71,4 @@ class Strategist:
         """`history`: earlier turns [{"role": "user"|"assistant", "content": str}] of this strategy chat."""
         messages = [*history, {"role": "user", "content": question}]
         messages[0] = {"role": "user", "content": f"{briefing}\n\n{messages[0]['content']}"}   # data goes first
-        response = self.client.beta.messages.create(
-            model=self.model,
-            max_tokens=16000,
-            system=[{"type": "text", "text": self.system, "cache_control": {"type": "ephemeral"}}],
-            messages=messages,
-            output_config={"effort": self.effort},
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-        )
-        if response.stop_reason == "refusal":
-            raise RuntimeError("Claude declined to answer this question")
-        return "".join(b.text for b in response.content if b.type == "text").strip()
+        return self.llm.text(system=self.system, messages=messages)

@@ -15,16 +15,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-import anthropic
 from pydantic import BaseModel, Field
 
 from .db import Database
+from .llm import LLM
 from .pipeline import transcript_text
 
 BATCH_CHARS = 60_000          # ~15k tokens of transcript per extraction call
 BATCH_MAX_CHATS = 40
-# Claude Opus 5.5 list prices, USD per million tokens (input, output).
-PRICE_PER_MTOK = {"claude-opus-5-5": (4.0, 20.0)}
 EST_OUTPUT_TOKENS_PER_BATCH = 4_000
 EST_MERGE_OUTPUT_TOKENS = 12_000
 
@@ -127,21 +125,19 @@ def _batch(chats: list[str]) -> list[str]:
 
 
 class BrandBuilder:
-    def __init__(self, brand_file: Path, *, model: str, effort: str, client: anthropic.Anthropic | None = None):
+    SYSTEM = "You analyse a small business's customer conversations to document how it sells."
+
+    def __init__(self, brand_file: Path, *, llm: LLM):
         self.brand = brand_file.read_text().strip() if brand_file.exists() else ""
-        self.model = model
-        self.effort = effort
-        self.client = client or anthropic.Anthropic()
+        self.llm = llm
 
     def plan(self, db: Database, ig_user_id: str, since: datetime) -> Plan:
         chats = _transcripts(db, ig_user_id, since)
         batches = _batch(chats)
-        tokens = sum(self.client.messages.count_tokens(
-            model=self.model, messages=[{"role": "user", "content": self._extract_prompt(b)}]).input_tokens
-            for b in batches)
+        tokens = sum(self.llm.count_tokens(system=self.SYSTEM, prompt=self._extract_prompt(b)) for b in batches)
         cost = None
-        if self.model in PRICE_PER_MTOK:
-            price_in, price_out = PRICE_PER_MTOK[self.model]
+        if price := self.llm.price():
+            price_in, price_out = price
             out = EST_OUTPUT_TOKENS_PER_BATCH * len(batches) + EST_MERGE_OUTPUT_TOKENS
             merge_in = EST_OUTPUT_TOKENS_PER_BATCH * len(batches) + len(self.brand) // 4
             cost = ((tokens + merge_in) * price_in + out * price_out) / 1_000_000
@@ -151,40 +147,13 @@ class BrandBuilder:
         return EXTRACT_PROMPT.format(brand=self.brand or "(empty)", transcripts=transcripts)
 
     def extract(self, transcripts: str) -> BatchFindings:
-        response = self.client.beta.messages.parse(
-            model=self.model,
-            max_tokens=16000,
-            messages=[{"role": "user", "content": self._extract_prompt(transcripts)}],
-            output_config={"effort": self.effort},
-            output_format=BatchFindings,
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-        )
-        if response.stop_reason == "refusal":
-            raise RuntimeError("Claude declined to analyse this batch of conversations")
-        if response.parsed_output is None:
-            raise RuntimeError(f"Could not parse findings (stop_reason={response.stop_reason})")
-        return response.parsed_output
+        return self.llm.parse(system=self.SYSTEM, prompt=self._extract_prompt(transcripts), schema=BatchFindings)
 
     def merge(self, findings: list[BatchFindings], chats: int) -> str:
         prompt = MERGE_PROMPT.format(
             chats=chats, brand=self.brand or "(empty)",
             findings=json.dumps([f.model_dump() for f in findings], indent=1, ensure_ascii=False))
-        # Long output with thinking always on: stream so the request can't hit an HTTP timeout.
-        with self.client.beta.messages.stream(
-            model=self.model,
-            max_tokens=64000,
-            messages=[{"role": "user", "content": prompt}],
-            output_config={"effort": self.effort},
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-        ) as stream:
-            message = stream.get_final_message()
-        if message.stop_reason == "refusal":
-            raise RuntimeError("Claude declined to write the brand profile")
-        if message.stop_reason == "max_tokens":
-            raise RuntimeError("Brand profile was cut off (max_tokens) - try fewer days")
-        text = "".join(block.text for block in message.content if block.type == "text").strip()
+        text = self.llm.text(system=self.SYSTEM, messages=[{"role": "user", "content": prompt}], long=True)
         if not text.startswith("#"):
             raise RuntimeError("Unexpected output: brand profile should start with a Markdown heading")
         return text + "\n"

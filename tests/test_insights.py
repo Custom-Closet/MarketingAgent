@@ -103,20 +103,23 @@ def test_overrides_and_settings(db):
 
 # ---- strategist -----------------------------------------------------------------------
 
-class FakeClaude:
+class FakeLLM:
+    model = "fake"
+
     def __init__(self):
         self.calls = []
-        self.beta = NS(messages=NS(create=self._create))
 
-    def _create(self, **kw):
-        self.calls.append(kw)
-        return NS(stop_reason="end_turn", content=[NS(type="thinking"), NS(type="text", text="## Fix replies\n- Answer within 1h")])
+    def text(self, *, system, messages, max_tokens=16000, long=False):
+        self.calls.append({"system": system, "messages": messages})
+        return "## Fix replies\n- Answer within 1h"
+
+    def price(self):
+        return (4.0, 20.0)
 
 
 def test_strategist_requires_confirmation_and_sends_briefing_first(db):
-    claude = FakeClaude()
-    service = InsightsService(db, our_id=US, strategist=Strategist("# Brand", model="claude-opus-5-5",
-                                                                    effort="medium", client=claude))
+    claude = FakeLLM()
+    service = InsightsService(db, our_id=US, strategist=Strategist("# Brand", llm=claude))
     est = service.strategy_estimate("Biggest leaks?", [])
     assert est["input_tokens"] > 0 and est["usd"] > 0
     with pytest.raises(ValueError):
