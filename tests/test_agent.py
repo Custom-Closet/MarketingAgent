@@ -573,3 +573,14 @@ def test_build_brand_cli_refuses_to_overwrite_brand_md(tmp_path, monkeypatch):
     monkeypatch.setenv("BRAND_FILE", str(tmp_path / "brand.md"))
     result = CliRunner().invoke(cli.app, ["build-brand", "--out", str(tmp_path / "brand.md")])
     assert result.exit_code != 0 and "must not be brand.md" in result.output
+
+
+def test_claude_configured_reads_key_from_environment(monkeypatch):
+    from marketing_agent import clients
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    assert not clients.claude_configured()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "  ")
+    assert not clients.claude_configured()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    assert clients.claude_configured()

@@ -31,6 +31,12 @@ def instagram_client(settings: Settings):
                            api_version=settings.graph_api_version)
 
 
+def claude_configured() -> bool:
+    """True when the Anthropic SDK has credentials to use (API key or auth token in the environment/.env)."""
+    import os
+    return bool(os.environ.get("ANTHROPIC_API_KEY", "").strip() or os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip())
+
+
 def writer(settings: Settings):
     from .personalize import Personalizer
     return Personalizer(settings.brand_file, model=settings.anthropic_model, effort=settings.anthropic_effort)

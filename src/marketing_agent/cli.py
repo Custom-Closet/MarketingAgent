@@ -412,10 +412,13 @@ def serve(
     repo = InboxRepository(db)
     added = repo.seed_faqs(load_faq_file(settings.faq_file))
     writer = None
-    try:
-        writer = clients.writer(settings)
-    except FileNotFoundError:
-        _log("[yellow]brand.md not found - 'Draft with Claude' is disabled.[/yellow]")
+    if not clients.claude_configured():
+        _log("[yellow]ANTHROPIC_API_KEY is not set in .env - 'Draft with Claude' and the strategist are off.[/yellow]")
+    else:
+        try:
+            writer = clients.writer(settings)
+        except FileNotFoundError:
+            _log("[yellow]brand.md not found - 'Draft with Claude' and the strategist are off.[/yellow]")
     service = InboxService(repo, our_id=settings.ig_user_id, ig=clients.instagram_client(settings), writer=writer)
     service.refresh_drafts()
     strategist = None
