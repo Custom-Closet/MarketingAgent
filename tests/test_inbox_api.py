@@ -93,3 +93,24 @@ def test_sales_marketing_and_settings_routes(client):
     assert settings["context_window_days"] == 10 and settings["archive"]["conversations"] == 2
     assert http.post("/api/settings", json={"context_window_days": 0}).status_code == 422
     assert http.post("/api/strategy/estimate", json={"question": "leaks?"}).status_code == 503   # no Claude
+
+
+def test_model_routes(inbox):
+    from marketing_agent.models import ModelManager
+    db, repo, service, ig = inbox
+    switched = []
+
+    class OkLLM:
+        def text(self, **_):
+            return "OK"
+
+    models = ModelManager(db, provider="bedrock", default_model="env.model", factory=lambda mid: OkLLM(),
+                          lister=lambda: [{"id": "amazon.nova-micro-v1:0", "low_cost": True}], on_switch=switched.append)
+    http = TestClient(create_app(service, models=models))
+    listing = http.get("/api/models").json()
+    assert listing["provider"] == "bedrock" and listing["current"] == "env.model" and listing["models"][0]["low_cost"]
+    assert http.post("/api/models/test", json={"model_id": "amazon.nova-micro-v1:0"}).json()["ok"]
+    assert http.post("/api/models/select", json={"model_id": "amazon.nova-micro-v1:0"}).json()["ok"]
+    assert http.get("/api/models").json()["current"] == "amazon.nova-micro-v1:0" and len(switched) == 1
+    assert http.post("/api/models/select", json={"model_id": " "}).status_code == 400
+    assert TestClient(create_app(service)).get("/api/models").json()["provider"] is None

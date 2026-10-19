@@ -100,6 +100,10 @@ def test_build_llm_picks_backend_by_model(tmp_path, monkeypatch):
     assert not is_claude_model("openai.gpt-5.5")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIATEST")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    default = build_llm(provider="bedrock", anthropic_model="", effort="medium",
+                        bedrock_model="anthropic.claude-opus-5-5", bedrock_region="ap-south-1", bedrock_api_key="k")
+    assert isinstance(default, ConverseLLM)                 # Claude on Bedrock defaults to Converse
+    monkeypatch.setenv("BEDROCK_USE_ANTHROPIC_SDK", "1")
     claude = build_llm(provider="bedrock", anthropic_model="", effort="medium", bedrock_model="anthropic.claude-opus-5-5",
                        bedrock_region="ap-south-1", bedrock_api_key="bedrock-key")
     assert isinstance(claude, ClaudeLLM) and claude.bedrock
@@ -115,3 +119,17 @@ def test_build_llm_picks_backend_by_model(tmp_path, monkeypatch):
     with pytest.raises(LLMError):
         build_llm(provider="bedrock", anthropic_model="", effort="m", bedrock_model="", bedrock_region="x",
                   bedrock_api_key="")
+
+
+def test_converse_learns_the_models_output_cap():
+    class CappedBedrock(FakeBedrock):
+        def converse(self, **kwargs):
+            if kwargs["inferenceConfig"]["maxTokens"] > 10000:
+                raise Exception("ValidationException: The maximum tokens you requested exceeds the model limit of 10000.")
+            return super().converse(**kwargs)
+
+    bedrock = CappedBedrock("first", "second")
+    llm = ConverseLLM("apac.amazon.nova-lite-v1:0", region="ap-south-1", client=bedrock)
+    assert llm.text(system="s", messages=[{"role": "user", "content": "q"}], max_tokens=16000) == "first"
+    assert llm.text(system="s", messages=[{"role": "user", "content": "q"}], max_tokens=16000) == "second"
+    assert [r["inferenceConfig"]["maxTokens"] for r in bedrock.requests] == [10000, 10000]   # remembered

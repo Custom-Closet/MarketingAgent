@@ -2,11 +2,11 @@
 
 Two backends behind one small interface:
 
-* ClaudeLLM   - Claude through the Anthropic SDK: the Claude API, or Claude on Amazon Bedrock
-                (AnthropicBedrockMantle, SigV4-signed with AWS access keys). Structured outputs
-                are enforced by the API.
-* ConverseLLM - any Bedrock model (e.g. openai.gpt-5.5, or Claude when only a Bedrock API key is
-                available) through boto3's Converse API.
+* ClaudeLLM   - Claude through the Anthropic SDK: the Claude API, or (opt-in with
+                BEDROCK_USE_ANTHROPIC_SDK=1) Claude on Amazon Bedrock via AnthropicBedrockMantle,
+                SigV4-signed with AWS access keys. Structured outputs are enforced by the API.
+* ConverseLLM - every Bedrock model by default (Nova, gpt-oss, Claude, Mistral, ...) through boto3's
+                Converse API, authenticated with the Bedrock API key.
                 The reply must be JSON matching the schema; it is validated here and retried
                 once with the validation error.
 
@@ -105,6 +105,7 @@ class ClaudeLLM:
 
 
 _JSON_BLOCK = re.compile(r"\{.*\}", re.S)
+_TOKEN_LIMIT = re.compile(r"model limit of (\d+)")
 
 
 def _extract_json(text: str) -> str:
@@ -122,14 +123,21 @@ class ConverseLLM:
             client = boto3.client("bedrock-runtime", region_name=region)
         self.client = client
         self.model = model
+        self.max_output: int | None = None     # learned from the model's "maximum tokens" error
 
     def _converse(self, system: str, messages: list[dict], max_tokens: int) -> str:
-        response = self.client.converse(
-            modelId=self.model,
-            system=[{"text": system}],
-            messages=[{"role": m["role"], "content": [{"text": m["content"]}]} for m in messages],
-            inferenceConfig={"maxTokens": max_tokens},
-        )
+        request = dict(modelId=self.model, system=[{"text": system}],
+                       messages=[{"role": m["role"], "content": [{"text": m["content"]}]} for m in messages])
+        max_tokens = min(max_tokens, self.max_output or max_tokens)
+        try:
+            response = self.client.converse(**request, inferenceConfig={"maxTokens": max_tokens})
+        except Exception as exc:
+            # Models cap output differently (e.g. Nova Lite: 10,000). Learn the cap from the error, retry once.
+            limit = _TOKEN_LIMIT.search(str(exc))
+            if not limit or int(limit.group(1)) >= max_tokens:
+                raise
+            self.max_output = int(limit.group(1))
+            response = self.client.converse(**request, inferenceConfig={"maxTokens": self.max_output})
         stop = response.get("stopReason")
         if stop in ("guardrail_intervened", "content_filtered"):
             raise LLMError(f"The model declined this request ({stop})")
@@ -174,8 +182,10 @@ def build_llm(*, provider: str, anthropic_model: str, effort: str, bedrock_model
         if not bedrock_region:
             raise LLMError("BEDROCK_REGION (or AWS_REGION) must be set when LLM_PROVIDER=bedrock")
         access_key, secret_key = os.environ.get("AWS_ACCESS_KEY_ID"), os.environ.get("AWS_SECRET_ACCESS_KEY")
-        if is_claude_model(bedrock_model) and access_key and secret_key:
-            # The Anthropic-on-Bedrock endpoint needs SigV4-signed requests; it rejects Bedrock API keys.
+        use_sdk = os.environ.get("BEDROCK_USE_ANTHROPIC_SDK", "").strip().lower() in ("1", "true", "yes")
+        if is_claude_model(bedrock_model) and use_sdk and access_key and secret_key:
+            # Opt-in: the Anthropic-on-Bedrock endpoint (structured outputs enforced by the API). It needs
+            # SigV4-signed requests and isn't served in every region.
             from anthropic import AnthropicBedrockMantle
             client = AnthropicBedrockMantle(aws_region=bedrock_region, aws_access_key=access_key,
                                             aws_secret_key=secret_key,

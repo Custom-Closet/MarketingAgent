@@ -126,6 +126,17 @@
           <button class="btn primary" onclick="saveSettings()">Save</button>
         </div>
       </div>
+      <div class="panel" style="margin-bottom:14px" id="st-model-panel" hidden>
+        <h2>Model</h2>
+        <p class="sub" id="st-model-current"></p>
+        <div class="form-row">
+          <select id="st-model" style="min-width:min(100%, 360px)"></select>
+          <button class="btn" onclick="testModel()">Test</button>
+          <button class="btn primary" onclick="useModel()">Use this model</button>
+          <button class="btn ghost" onclick="loadModels(true)">Refresh list</button>
+        </div>
+        <p class="stat" id="st-model-result"></p>
+      </div>
       <h2 style="font-size:16px">FAQ answers</h2>
       <p class="stat">Approved answers can be approved in bulk from Chat with one click. Editing an answer removes its approval until you approve it again.</p>
       <div id="faq-list"></div>

@@ -405,8 +405,14 @@ def serve(
     from .inbox.api import create_app
     from .inbox.faq import load_faq_file
     from .inbox.repository import InboxRepository
+    from dataclasses import replace
+
     from .inbox.service import InboxService
     from .insights.service import InsightsService
+    from .insights.strategist import Strategist
+    from .models import SETTING_KEY as MODEL_SETTING
+    from .models import ModelManager, list_bedrock_text_models
+    from .personalize import Personalizer
 
     settings = load_settings()
     if settings.db_s3_uri:
@@ -414,11 +420,15 @@ def serve(
     db = Database(settings.db_path, check_same_thread=False)
     repo = InboxRepository(db)
     added = repo.seed_faqs(load_faq_file(settings.faq_file))
+    # The model picked in Settings (stored in the database) wins over BEDROCK_MODEL_ID.
+    if settings.llm_provider == "bedrock":
+        settings = replace(settings, bedrock_model_id=db.setting(MODEL_SETTING) or settings.bedrock_model_id)
     writer = None
     if not clients.llm_configured(settings):
         missing = ("BEDROCK_MODEL_ID / BEDROCK_REGION / AWS_BEARER_TOKEN_BEDROCK" if settings.llm_provider == "bedrock"
                    else "ANTHROPIC_API_KEY")
-        _log(f"[yellow]{missing} not set in .env - 'Draft with Claude' and the strategist are off.[/yellow]")
+        _log(f"[yellow]{missing} not set - 'Draft with Claude' and the strategist are off "
+             "(on Bedrock you can pick a model in Settings).[/yellow]")
     else:
         try:
             writer = clients.writer(settings)
@@ -427,16 +437,24 @@ def serve(
             _log("[yellow]brand.md not found - 'Draft with Claude' and the strategist are off.[/yellow]")
     service = InboxService(repo, our_id=settings.ig_user_id, ig=clients.instagram_client(settings), writer=writer)
     service.refresh_drafts()
-    strategist = None
-    if writer is not None:
-        from .insights.strategist import Strategist
-        strategist = Strategist(settings.brand_file.read_text(), llm=writer.llm)
+    strategist = Strategist(settings.brand_file.read_text(), llm=writer.llm) if writer else None
     insights = InsightsService(db, our_id=settings.ig_user_id, lock=service.lock, strategist=strategist)
+
+    def use_model(llm) -> None:
+        if not settings.brand_file.exists():
+            raise ValueError("brand.md not found - create it before drafting")
+        service.writer = Personalizer(settings.brand_file, llm=llm)
+        insights.strategist = Strategist(settings.brand_file.read_text(), llm=llm)
+
+    models = ModelManager(
+        db, provider=settings.llm_provider, default_model=settings.bedrock_model_id,
+        factory=lambda model_id: clients.llm(replace(settings, llm_provider="bedrock", bedrock_model_id=model_id)),
+        lister=lambda: list_bedrock_text_models(settings.bedrock_region), on_switch=use_model)
     url = f"http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}"
     _log(f"Inbox at {url}  ({added} new FAQs loaded from {settings.faq_file}). Ctrl+C to stop.")
     if open_browser:
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()
-    uvicorn.run(create_app(service, insights), host=host, port=port, log_level="warning")
+    uvicorn.run(create_app(service, insights, models), host=host, port=port, log_level="warning")
 
 
 # ---- tracking ------------------------------------------------------------

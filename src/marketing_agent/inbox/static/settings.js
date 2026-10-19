@@ -11,14 +11,47 @@ async function loadSettings() {
     const a = s.archive, sync = s.status.sync;
     $("st-status").innerHTML = [
       `<li>${ok(s.status.instagram, "connected", "not set")} Instagram (IG_ACCESS_TOKEN in .env)</li>`,
-      `<li>${ok(s.status.claude_drafts, "on", "off")} Draft with Claude (ANTHROPIC_API_KEY + brand.md)</li>`,
+      `<li>${ok(s.status.claude_drafts, "on", "off")} AI reply drafts (model + brand.md)</li>`,
       `<li>${ok(s.status.strategist, "on", "off")} Funnel strategist</li>`,
       `<li><span class="pill">${fmt(a.conversations)} chats · ${fmt(a.messages)} messages</span> Archive, newest message ${a.newest_message ? new Date(a.newest_message).toLocaleString("en-IN") : "–"}</li>`,
       `<li><span class="pill">${fmt(a.summaries)}</span> Chats with a compressed summary</li>`,
       `<li><span class="pill">${sync.running ? "running" : sync.last_finished ? "done" : "not yet"}</span> Last sync ${sync.last_finished ? new Date(sync.last_finished).toLocaleString("en-IN") : ""}${sync.last_error ? ` – failed: ${esc(sync.last_error)}` : ""}</li>`,
     ].join("");
     renderFaqs();
+    loadModels(false);
   } catch (e) { toast("Couldn't load settings: " + e.message); }
+}
+
+// ---- model picker (Bedrock) ----
+
+async function loadModels(refresh) {
+  const m = await api("/api/models" + (refresh ? "?refresh=true" : "")).catch((e) => ({ error: e.message, models: [] }));
+  $("st-model-panel").hidden = m.provider !== "bedrock";
+  if (m.provider !== "bedrock") return;
+  $("st-model-current").textContent = `In use: ${m.current || "none yet"} · "Low cost" marks cheaper model families; see Bedrock pricing for exact rates.`;
+  const options = m.models.map((x) => `<option value="${esc(x.id)}" ${x.id === m.current ? "selected" : ""}>${x.low_cost ? "★ " : ""}${esc(x.id)}${x.low_cost ? " (low cost)" : ""}</option>`);
+  if (m.current && !m.models.some((x) => x.id === m.current)) options.unshift(`<option value="${esc(m.current)}" selected>${esc(m.current)}</option>`);
+  $("st-model").innerHTML = options.join("") || `<option value="">No models listed</option>`;
+  $("st-model-result").textContent = m.error ? `Couldn't list models: ${m.error}` : "";
+}
+
+function showModelResult(r) {
+  $("st-model-result").textContent = r.ok ? `✓ ${r.model} works (replied "${r.reply}" in ${r.seconds}s)` : `✗ ${r.model}: ${r.error}`;
+}
+
+async function testModel() {
+  $("st-model-result").textContent = "Testing…";
+  try { showModelResult(await api("/api/models/test", { method: "POST", body: { model_id: $("st-model").value } })); }
+  catch (e) { $("st-model-result").textContent = e.message; }
+}
+
+async function useModel() {
+  $("st-model-result").textContent = "Testing, then switching…";
+  try {
+    const r = await api("/api/models/select", { method: "POST", body: { model_id: $("st-model").value } });
+    showModelResult(r);
+    if (r.ok) { toast(`Now drafting with ${r.model}`); loadSettings(); }
+  } catch (e) { $("st-model-result").textContent = e.message; }
 }
 
 async function saveSettings() {

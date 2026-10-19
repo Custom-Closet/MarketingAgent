@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ..insights.service import InsightsService
+from ..models import ModelManager
 from .service import InboxService, QueueFilters, SendNotConfirmed
 
 STATIC = Path(__file__).parent / "static"
@@ -55,6 +56,10 @@ class StrategyRequest(BaseModel):
     confirm: bool = False
 
 
+class ModelChoice(BaseModel):
+    model_id: str
+
+
 class SettingsUpdate(BaseModel):
     context_window_days: int | None = Field(None, ge=1, le=60)
     lost_after_days: int | None = Field(None, ge=3, le=120)
@@ -67,7 +72,8 @@ def _filters(priority: str | None, category: str | None, customer_type: str | No
                         max_hours_left=max_hours_left, search=q or None)
 
 
-def create_app(service: InboxService, insights: InsightsService | None = None) -> FastAPI:
+def create_app(service: InboxService, insights: InsightsService | None = None,
+               models: ModelManager | None = None) -> FastAPI:
     app = FastAPI(title="Custom Closet", docs_url="/api/docs")
     insights = insights or InsightsService(service.repo.db, our_id=service.our_id, lock=service.lock)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -201,6 +207,31 @@ def create_app(service: InboxService, insights: InsightsService | None = None) -
             "archive": {"conversations": counts[0], "messages": counts[1], "newest_message": counts[2],
                         "summaries": counts[3]},
         }
+
+    # ---- model (Bedrock) ---------------------------------------------------------------
+
+    @app.get("/api/models")
+    def list_models(refresh: bool = False):
+        if models is None:
+            return {"provider": None, "current": None, "models": []}
+        try:
+            available = models.available(refresh=refresh)
+            error = None
+        except Exception as exc:   # e.g. AWS credentials file unreadable
+            available, error = [], str(exc)[:300]
+        return {"provider": models.provider, "current": models.current(), "models": available, "error": error}
+
+    @app.post("/api/models/test")
+    def test_model(req: ModelChoice):
+        if models is None:
+            raise HTTPException(503, "Model switching isn't available")
+        return models.test(req.model_id)
+
+    @app.post("/api/models/select")
+    def select_model(req: ModelChoice):
+        if models is None:
+            raise HTTPException(503, "Model switching isn't available")
+        return guard(models.select, req.model_id)
 
     @app.post("/api/settings")
     def update_settings(req: SettingsUpdate):

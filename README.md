@@ -61,10 +61,13 @@ BEDROCK_REGION=ap-south-1                         # defaults to AWS_REGION
 AWS_BEARER_TOKEN_BEDROCK=...                      # Bedrock API key
 ```
 
-- Claude models with `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` set use the Anthropic SDK's Bedrock
-  client (SigV4) - structured outputs and prompt caching as on the Claude API.
-- Any other model, or Claude with only a Bedrock API key, goes through the Bedrock Converse API; replies
-  are requested as JSON and validated, with one retry.
+- Every model goes through the Bedrock Converse API with the Bedrock API key; replies are requested as
+  JSON and validated, with one retry. Pick a model in **Settings → Model**: low-cost families (Amazon Nova
+  Micro/Lite, gpt-oss, Claude Haiku, Ministral, Gemma) are listed first, **Test** makes one tiny call, and
+  **Use this model** switches drafting and the strategist without a restart.
+- Optional: `BEDROCK_USE_ANTHROPIC_SDK=1` sends Claude models through the Anthropic SDK's Bedrock client
+  (SigV4 with `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), where your region serves it.
+- Claude models on Bedrock also need Anthropic's one-time use-case form (Bedrock console → Model catalog).
 - Enable the model first under **Bedrock console → Model access** in that region. "is not available for
   this account" means access hasn't been granted yet. Costs are billed by AWS, so the app shows token
   estimates instead of dollar amounts.
