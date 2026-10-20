@@ -30,3 +30,7 @@ seen_brands.csv
 
 # Build output
 infra/cdk.out/
+
+# docs build (docs/system-design/build_docx.js)
+node_modules/
+package-lock.json
