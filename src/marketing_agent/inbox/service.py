@@ -3,10 +3,16 @@
 Every send still passes the pipeline's send-time gates (approval recorded, reply window open,
 not suppressed, no duplicate, length) plus one more: the customer must not already have been
 answered from the Instagram app. Sends also require an explicit confirmation from the caller.
+
+Auto-send (off unless enabled in Settings): an open draft whose text is an unchanged *trusted*
+FAQ answer (see faq.py) is scheduled AUTO_SEND_DELAY after it becomes eligible. If nobody edits,
+holds, dismisses or sends it by then, the background job approves it as "auto" and sends it
+through the same gates. Any failed attempt holds the draft for a person to handle.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
 from dataclasses import asdict, dataclass, field
@@ -21,6 +27,11 @@ from .repository import InboxRepository
 
 MAX_SEND_BATCH = 25                     # replies per send request; the client throttles to 1 call/second
 URGENT_HOURS = 4                        # reply window closing soon
+AUTO_SEND_DELAY = timedelta(minutes=1)  # time a person has to step in before a trusted FAQ answer goes out
+SYNC_EVERY = timedelta(minutes=15)      # background Instagram check while `agent serve` runs
+JOB_TICK_SECONDS = 5                    # how often the background job looks for due auto-sends
+
+log = logging.getLogger(__name__)
 
 INTENT_WORDS = ("price", "pricing", "cost", "rate", "quote", "quotation", "sample", "order", "bulk", "moq",
                 "pieces", "charge", "how much", "kitna", "tech pack", "techpack", "export")
@@ -46,6 +57,8 @@ class QueueItem:
     category: str                       # FAQ key, "reference_image", "greeting" or "other"
     faq_question: str | None
     faq_approved: bool                  # draft uses an approved FAQ answer unchanged -> one-click approvable
+    auto_send_at: str | None            # when this draft sends itself unless someone steps in
+    auto_send_held: bool                # a person held it (or an auto-send failed): never auto-sent
     customer_type: str                  # brand / personal / unknown
     priority: str                       # high / medium / low
     score: int
@@ -122,13 +135,25 @@ class InboxService:
         self.writer = writer
         self.clock = clock
         self.lock = threading.RLock()       # one SQLite connection shared by the web server's threads
-        self.sync_state = {"running": False, "last_finished": None, "last_error": None, "conversations": 0}
+        self.sync_state = {"running": False, "last_finished": None, "last_error": None, "conversations": 0,
+                           "next_run": None}
+        self._sending: set[int] = set()     # drafts being sent right now (manual send vs. auto-send race)
+        self._stop = threading.Event()
 
     # ---- settings -----------------------------------------------------------------
 
     def window_days(self) -> int:
         """Days of recent messages Claude sees verbatim; older ones are summarised."""
         return int(self.repo.db.setting("context_window_days", str(DEFAULT_WINDOW_DAYS)))
+
+    def auto_send_enabled(self) -> bool:
+        return self.repo.db.setting("auto_send_faq", "0") == "1"
+
+    def set_auto_send(self, enabled: bool) -> None:
+        """Turning it on starts a fresh one-minute countdown on every eligible draft; off cancels them."""
+        with self.lock:
+            self.repo.db.set_setting("auto_send_faq", "1" if enabled else "0")
+            self.schedule_auto_sends()
 
     # ---- FAQ library ----------------------------------------------------------
 
@@ -140,6 +165,7 @@ class InboxService:
         with self.lock:
             self._require_faq(key)
             self.repo.update_faq(key, approved=approved)
+            self.schedule_auto_sends()
 
     def edit_faq(self, key: str, answer: str, keywords: list[str] | None = None) -> None:
         """Editing an answer withdraws its approval, so it must be approved again."""
@@ -148,6 +174,7 @@ class InboxService:
         with self.lock:
             self._require_faq(key)
             self.repo.update_faq(key, answer=answer.strip(), keywords=keywords, approved=False)
+            self.schedule_auto_sends()
 
     def _require_faq(self, key: str) -> FAQ:
         faq = self.repo.faq(key)
@@ -243,6 +270,7 @@ class InboxService:
                                        reply_deadline=datetime.fromisoformat(thread["last_inbound_at"]) + REPLY_WINDOW,
                                        faq_key=faq.key if faq else None)
                 created += 1
+            self.schedule_auto_sends()
         return created
 
     def _answered_elsewhere(self, draft) -> bool:
@@ -287,6 +315,7 @@ class InboxService:
             last_inbound_at=unanswered[-1]["created_time"] if unanswered else None, hours_left=hours,
             category=category, faq_question=faq.question if faq else None,
             faq_approved=bool(faq and faq.approved and d["body"].strip() == faq.answer.strip()),
+            auto_send_at=d["auto_send_at"], auto_send_held=bool(d["auto_send_hold"]),
             customer_type=customer_type, priority=label, score=score, reasons=reasons, body=d["body"],
             error=d["error"])
 
@@ -318,14 +347,17 @@ class InboxService:
         """Change a draft's text. An approved draft goes back to pending so it's reviewed again."""
         with self.lock:
             self._open_draft(draft_id)
-            self.repo.update_draft(draft_id, body=body.strip(), status="pending", approved_at=None)
+            self.repo.update_draft(draft_id, body=body.strip(), status="pending", approved_at=None, auto_send_at=None)
+            self.schedule_auto_sends()      # editing back to the exact trusted answer restarts the countdown
 
     def apply_faq(self, draft_ids: list[int], key: str) -> int:
         with self.lock:
             faq = self._require_faq(key)
             for draft_id in draft_ids:
                 self._open_draft(draft_id)
-                self.repo.update_draft(draft_id, body=faq.answer, faq_key=key, status="pending", approved_at=None)
+                self.repo.update_draft(draft_id, body=faq.answer, faq_key=key, status="pending", approved_at=None,
+                                       auto_send_at=None)
+            self.schedule_auto_sends()
         return len(draft_ids)
 
     def approve(self, draft_ids: list[int]) -> dict[int, str]:
@@ -345,6 +377,13 @@ class InboxService:
         ids = [i.draft_id for i in self.queue(filters) if i.status == "pending" and i.faq_approved]
         self.approve(ids)
         return ids
+
+    def hold(self, draft_ids: list[int]) -> None:
+        """Stop these drafts from ever being auto-sent; they wait for a person like any other draft."""
+        with self.lock:
+            for draft_id in draft_ids:
+                self._open_draft(draft_id)
+                self.repo.update_draft(draft_id, auto_send_hold=1, auto_send_at=None)
 
     def reject(self, draft_ids: list[int]) -> None:
         with self.lock:
@@ -381,13 +420,14 @@ class InboxService:
         for draft_id in draft_ids:
             with self.lock:
                 draft = self.repo.draft(draft_id)
-                reason = self._send_blocker(draft)
+                reason = "already being sent" if draft_id in self._sending else self._send_blocker(draft)
                 if reason:
                     result.blocked[draft_id] = reason
                     if draft and draft["status"] == "approved" and reason in ("reply window closed", "answered in Instagram"):
                         self.repo.update_draft(draft_id, status="expired" if "window" in reason else "rejected",
                                                error=reason)
                     continue
+                self._sending.add(draft_id)
             try:
                 self.ig.send_reply(draft["thread_id"], draft["body"])
             except InstagramRateLimited as exc:
@@ -398,9 +438,13 @@ class InboxService:
                 with self.lock:
                     self.repo.update_draft(draft_id, error=str(exc))
                 continue
-            with self.lock:
-                self.repo.db.mark_sent(draft_id)
-            result.sent.append(draft_id)
+            else:
+                with self.lock:
+                    self.repo.db.mark_sent(draft_id)
+                result.sent.append(draft_id)
+            finally:
+                with self.lock:
+                    self._sending.discard(draft_id)
         return result
 
     def _send_blocker(self, draft) -> str | None:
@@ -414,6 +458,99 @@ class InboxService:
             return "answered in Instagram"
         return None
 
+    # ---- auto-send ----------------------------------------------------------------------
+
+    def _auto_sendable(self, draft, faqs: dict[str, FAQ]) -> bool:
+        faq = faqs.get(draft["faq_key"]) if draft["faq_key"] else None
+        return bool(faq and faq.trusted and not draft["auto_send_hold"] and draft["body"].strip()
+                    and draft["body"].strip() == faq.answer.strip())
+
+    def schedule_auto_sends(self) -> None:
+        """Give newly eligible drafts a send time AUTO_SEND_DELAY from now; clear it on drafts no longer eligible."""
+        with self.lock:
+            enabled = self.ig is not None and self.auto_send_enabled()   # nothing could send it otherwise
+            faqs = {f.key: f for f in self.repo.faqs()}
+            due_at = (self.clock() + AUTO_SEND_DELAY).astimezone(timezone.utc).isoformat(timespec="seconds")
+            for d in self.repo.open_drafts():
+                eligible = enabled and self._auto_sendable(d, faqs)
+                if eligible and not d["auto_send_at"]:
+                    self.repo.update_draft(d["id"], auto_send_at=due_at)
+                elif not eligible and d["auto_send_at"]:
+                    self.repo.update_draft(d["id"], auto_send_at=None)
+
+    def run_auto_sends(self) -> SendResult:
+        """Send every draft whose auto-send time has passed and that is still eligible."""
+        result = SendResult()
+        if self.ig is None:
+            return result
+        with self.lock:
+            self.schedule_auto_sends()
+            due = self.repo.due_auto_sends(self.clock())[:MAX_SEND_BATCH]
+        due = [i for i in due if self._caught_up(i)]
+        ids = []
+        with self.lock:
+            faqs = {f.key: f for f in self.repo.faqs()}
+            for draft_id in due:
+                draft = self.repo.draft(draft_id)
+                if not self._auto_sendable(draft, faqs):   # edited or held while we were fetching
+                    continue
+                if draft["status"] == "pending":
+                    self.repo.approve(draft_id, by="auto")
+                ids.append(draft_id)
+        if not ids:
+            return result
+        # confirm=True: a person approved this exact text (in Settings or 3+ times) and had a minute to step in.
+        result = self.send(ids, confirm=True)
+        with self.lock:
+            for draft_id in ids:
+                if draft_id not in result.sent:     # blocked, failed or not reached: leave it to a person
+                    self.repo.update_draft(draft_id, auto_send_at=None, auto_send_hold=1)
+        for draft_id in result.sent:
+            log.info("auto-sent FAQ reply %s", draft_id)
+        return result
+
+    def _caught_up(self, draft_id: int) -> bool:
+        """Fetch this chat's newest messages so a reply typed in the Instagram app since the last sync
+        blocks the auto-send. False (and the draft is held) if Instagram can't be read right now."""
+        with self.lock:
+            draft = self.repo.draft(draft_id)
+            cid = draft["conversation_id"]
+            latest = self.repo.db.ig_latest_message_time(cid) if cid else None
+        if not cid or not latest:
+            return True
+        try:
+            fetched = self.ig.messages(cid, stop_before=datetime.fromisoformat(latest))
+        except InstagramError as exc:
+            with self.lock:
+                self.repo.update_draft(draft_id, auto_send_at=None, auto_send_hold=1, error=f"auto-send held: {exc}")
+            return False
+        with self.lock:
+            self.repo.db.add_ig_messages(cid, fetched)
+        return True
+
+    # ---- background jobs ----------------------------------------------------------------
+
+    def start_background_jobs(self, *, sync_every: timedelta = SYNC_EVERY, tick: float = JOB_TICK_SECONDS) -> None:
+        """While the app runs: check Instagram now and every `sync_every`, and send due auto-replies."""
+        threading.Thread(target=self._run_jobs, args=(sync_every, tick), daemon=True).start()
+
+    def stop_background_jobs(self) -> None:
+        self._stop.set()
+
+    def _run_jobs(self, sync_every: timedelta, tick: float) -> None:
+        next_sync = self.clock()
+        while not self._stop.is_set():
+            now = self.clock()
+            if self.ig is not None and now >= next_sync:
+                self.start_background_sync()
+                next_sync = now + sync_every
+                self.sync_state["next_run"] = next_sync.isoformat(timespec="seconds")
+            try:
+                self.run_auto_sends()
+            except Exception:
+                log.exception("auto-send failed")
+            self._stop.wait(tick)
+
     # ---- overview ---------------------------------------------------------------------
 
     def stats(self) -> dict:
@@ -425,6 +562,9 @@ class InboxService:
             "closing_soon": sum(i.hours_left <= URGENT_HOURS for i in items),
             "faq_ready": sum(i.status == "pending" and i.faq_approved for i in items),
             "sent_24h": self.repo.sent_replies_since(self.clock() - timedelta(hours=24)),
+            "auto_sent_24h": self.repo.sent_replies_since(self.clock() - timedelta(hours=24), approved_by="auto"),
+            "auto_send": {"enabled": self.auto_send_enabled(),
+                          "scheduled": sum(bool(i.auto_send_at) for i in items)},
             "sync": dict(self.sync_state),
         }
 

@@ -2,6 +2,10 @@
 
 FAQs are seeded from a JSON file (faqs.json, gitignored - see faqs.example.json) into the
 database, where the inbox can edit and approve them.
+
+An answer is *trusted* - and may be auto-sent - once it is approved in Settings, or once drafts
+using it word for word were approved by hand AUTO_SEND_AFTER_APPROVALS times. Editing the
+answer resets both, because the count only covers drafts that match the current text.
 """
 
 from __future__ import annotations
@@ -11,6 +15,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+AUTO_SEND_AFTER_APPROVALS = 3
+
 
 @dataclass(frozen=True)
 class FAQ:
@@ -19,6 +25,11 @@ class FAQ:
     answer: str
     keywords: tuple[str, ...]
     approved: bool = False
+    approvals: int = 0                  # drafts using this exact answer that were approved by hand
+
+    @property
+    def trusted(self) -> bool:
+        return self.approved or self.approvals >= AUTO_SEND_AFTER_APPROVALS
 
 
 def load_faq_file(path: Path) -> list[FAQ]:

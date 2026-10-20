@@ -114,3 +114,19 @@ def test_model_routes(inbox):
     assert http.get("/api/models").json()["current"] == "amazon.nova-micro-v1:0" and len(switched) == 1
     assert http.post("/api/models/select", json={"model_id": " "}).status_code == 400
     assert TestClient(create_app(service)).get("/api/models").json()["provider"] is None
+
+
+def test_auto_send_setting_hold_and_faq_trust(client):
+    http, (_, repo, _, _) = client
+    assert http.get("/api/settings").json()["auto_send_faq"] is False
+    assert http.post("/api/settings", json={"auto_send_faq": True}).status_code == 200
+    assert http.post("/api/faqs/location", json={"approved": True}).status_code == 200
+    fan = next(i for i in http.get("/api/queue").json() if i["username"] == "fan")
+    assert fan["auto_send_at"] and fan["auto_send_held"] is False
+    assert http.get("/api/stats").json()["auto_send"] == {"enabled": True, "scheduled": 1}
+    assert http.post("/api/drafts/hold", json={"ids": [fan["draft_id"]]}).status_code == 200
+    fan = next(i for i in http.get("/api/queue").json() if i["username"] == "fan")
+    assert fan["auto_send_at"] is None and fan["auto_send_held"] is True
+    assert http.post("/api/drafts/hold", json={"ids": [999]}).status_code == 404
+    location = next(f for f in http.get("/api/faqs").json() if f["key"] == "location")
+    assert location["trusted"] and location["approvals"] == 0

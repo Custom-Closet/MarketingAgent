@@ -56,7 +56,7 @@ class FakeIG:
 
     def messages(self, conversation_id, *, stop_before=None, **_):
         from marketing_agent.sources.instagram import parse_time
-        return [m for m in self.history[conversation_id]
+        return [m for m in self.history.get(conversation_id, [])
                 if not stop_before or parse_time(m["created_time"]) >= stop_before]
 
     def send_reply(self, recipient_id, text):

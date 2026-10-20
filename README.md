@@ -154,6 +154,8 @@ PYTHONPATH=src uv run --no-sync python -m marketing_agent.cli serve
 
 1. **Check for new messages** reads chats from the last 23 hours (read-only, rate-limited) and
    prepares a reply for every customer still waiting. Common questions are pre-filled from the FAQ.
+   The app also does this by itself when it starts and every 15 minutes while it runs, and the Chat
+   page reloads every 20 seconds (it never reloads over a reply you're typing).
 2. **FAQ answers** tab: approve each answer once. From then on, replies that use an approved
    answer unchanged can all be approved with **Approve all** on the inbox.
 3. Filter by priority (high = asking about price/samples, sent a reference image, a clothing brand, or
@@ -163,7 +165,17 @@ PYTHONPATH=src uv run --no-sync python -m marketing_agent.cli serve
    skipped if the window has closed, the customer was already answered in the Instagram app, or they
    unsubscribed. At most 25 per batch.
 
-Nothing is ever sent without approval and that final confirmation. `agent serve` uses the local
+Nothing is sent without approval and that final confirmation, with one opt-in exception:
+
+**Auto-send trusted FAQ answers** (Settings, off by default). An FAQ answer is *trusted* once you
+approve it in Settings, or once you've approved drafts using it unchanged in Chat 3 times. With
+auto-send on, a draft whose text is an unchanged trusted answer shows **Auto-sends in 60s**. If
+nobody edits it, clicks into it, presses **Hold**, dismisses it or sends it within that minute, the
+app approves it as `auto` and sends it through the same send gates. A failed attempt is held for you,
+never retried. Editing an FAQ answer removes its trust. Auto-send only runs while `agent serve` is
+running; the daily Lambda job never auto-sends.
+
+`agent serve` uses the local
 database (`AGENT_DB_PATH`); it refuses to start when `AGENT_DB_S3_URI` is set.
 
 The sidebar has four modules:
@@ -177,7 +189,8 @@ The sidebar has four modules:
   estimated cost (about $0.07 per question).
 - **Marketing** - reply rates per outreach message (other brands' instant auto-replies excluded)
   and how each lead source converts.
-- **Settings** - status, FAQ answers, the lost-after window and the drafting context window.
+- **Settings** - status, FAQ answers (with how often each was approved, and whether it's trusted),
+  auto-send, the lost-after window and the drafting context window.
 
 **Drafting context.** All raw messages stay in the database. When Claude drafts a reply it sees the
 last N days of the chat word for word (Settings, default 7) plus a short summary of everything

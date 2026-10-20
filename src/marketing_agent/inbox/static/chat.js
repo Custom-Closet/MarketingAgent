@@ -1,8 +1,6 @@
 // Chat module: the reply inbox (queue, filters, bulk actions, send confirmation).
-const state = { items: [], faqs: [], selected: new Set(), priority: new Set(), openChat: new Set() };
-
-
-
+const state = { items: [], faqs: [], selected: new Set(), priority: new Set(), openChat: new Set(), transcripts: {} };
+const REFRESH_MS = 20000;   // reload the queue this often while Chat is open (the server checks Instagram every 15 min)
 
 function togglePriority(el) {
   el.classList.toggle("on");
@@ -36,8 +34,12 @@ async function loadChat() {
 async function loadStats() {
   const s = await api("/api/stats").catch(() => null);
   if (!s) return;
-  const sync = s.sync.running ? ` · syncing… (${s.sync.conversations} chats)` : s.sync.last_error ? ` · last sync failed: ${esc(s.sync.last_error)}` : "";
-  $("stats").innerHTML = `<b>${s.open}</b> to reply · <b>${s.high}</b> high · <b>${s.closing_soon}</b> closing soon · <b>${s.sent_24h}</b> sent today${sync}`;
+  const clock = (iso) => new Date(iso).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" });
+  const sync = s.sync.running ? ` · syncing… (${s.sync.conversations} chats)`
+    : s.sync.last_error ? ` · last sync failed: ${esc(s.sync.last_error)}`
+    : s.sync.last_finished ? ` · checked ${clock(s.sync.last_finished)}${s.sync.next_run ? `, next ${clock(s.sync.next_run)}` : ""}` : "";
+  const auto = s.auto_send.enabled ? ` · auto-send on (${s.auto_sent_24h} today)` : "";
+  $("stats").innerHTML = `<b>${s.open}</b> to reply · <b>${s.high}</b> high · <b>${s.closing_soon}</b> closing soon · <b>${s.sent_24h}</b> sent today${auto}${sync}`;
   $("sync-btn").disabled = s.sync.running;
   $("chat-badge").hidden = !s.open; $("chat-badge").textContent = s.open;
   if (s.sync.running) setTimeout(() => !$("chat").hidden && loadChat(), 4000);
@@ -79,9 +81,27 @@ function renderQueue() {
   document.querySelectorAll("[data-needs-selection]").forEach((el) => (el.disabled = !state.selected.size));
 }
 
+function countdownText(iso) {
+  const secs = Math.round((new Date(iso) - Date.now()) / 1000);
+  return secs > 0 ? `Auto-sends in ${secs}s` : "Auto-sending…";
+}
+
+function autoSendBadge(i) {
+  if (i.auto_send_at) {
+    return `<span class="pill auto" data-countdown="${esc(i.auto_send_at)}" title="Trusted FAQ answer. Edit it, hold it or send it yourself to stop this.">${countdownText(i.auto_send_at)}</span>
+      <button class="btn ghost small" onclick="holdOne(${i.draft_id})">Hold</button>`;
+  }
+  return i.auto_send_held ? `<span class="pill" title="Won't be sent automatically">auto-send held</span>` : "";
+}
+
+function transcriptHtml(msgs) {
+  return msgs.map((m) => `<div class="msg ${m.from}">${m.text ? esc(m.text) : '<span class="att">[attachment]</span>'}</div>`).join("") || "No messages stored.";
+}
+
 function card(i) {
   const said = i.customer_messages.map(esc).join("\n") + (i.sent_attachment ? `\n<span class="att">[sent an image / attachment]</span>` : "");
-  const chat = state.openChat.has(i.draft_id) ? `<div class="transcript" id="chat-${i.draft_id}">Loading…</div>` : "";
+  const cached = state.transcripts[i.draft_id];
+  const chat = state.openChat.has(i.draft_id) ? `<div class="transcript" id="chat-${i.draft_id}">${cached ? transcriptHtml(cached) : "Loading…"}</div>` : "";
   return `<div class="card ${i.status === "approved" ? "approved" : ""}">
     <input type="checkbox" ${state.selected.has(i.draft_id) ? "checked" : ""} onchange="toggleSelect(${i.draft_id}, this.checked)">
     <div>
@@ -91,13 +111,14 @@ function card(i) {
         <span class="pill">${esc(faqName(i.category))}</span>
         ${i.customer_type !== "unknown" ? `<span class="pill">${i.customer_type === "brand" ? "clothing brand" : "personal"}</span>` : ""}
         ${i.status === "approved" ? `<span class="pill ok">approved</span>` : ""}
+        ${autoSendBadge(i)}
         <span class="spacer"></span>
         <span class="time ${i.hours_left <= 4 ? "urgent" : ""}">${hoursText(i.hours_left)}</span>
       </div>
       <div class="said">${said || '<span class="att">(no text)</span>'}</div>
       ${i.reasons.length ? `<div class="reasons">Why: ${esc(i.reasons.join(" · "))}</div>` : ""}
       ${i.error ? `<div class="reasons" style="color:var(--high)">${esc(i.error)}</div>` : ""}
-      <textarea id="body-${i.draft_id}" placeholder="Write a reply, pick an FAQ answer, or ask Claude for a draft">${esc(i.body)}</textarea>
+      <textarea id="body-${i.draft_id}" onfocus="holdOnEdit(${i.draft_id})" placeholder="Write a reply, pick an FAQ answer, or ask Claude for a draft">${esc(i.body)}</textarea>
       <div class="actions">
         ${i.status === "approved" ? `<button class="btn" onclick="saveDraft(${i.draft_id})">Save changes</button>`
           : `<button class="btn primary" onclick="approveOne(${i.draft_id})">Approve</button>`}
@@ -114,12 +135,49 @@ function toggleSelect(id, on) { on ? state.selected.add(id) : state.selected.del
 function selectAll(on) { state.selected = new Set(on ? state.items.map((i) => i.draft_id) : []); renderQueue(); }
 
 async function toggleChat(id, conversationId) {
-  if (state.openChat.has(id)) { state.openChat.delete(id); renderQueue(); return; }
+  if (state.openChat.has(id)) { state.openChat.delete(id); delete state.transcripts[id]; renderQueue(); return; }
   state.openChat.add(id); renderQueue();
   const msgs = await api(`/api/conversations/${encodeURIComponent(conversationId)}`).catch(() => []);
+  state.transcripts[id] = msgs;
   const el = $(`chat-${id}`);
-  if (el) el.innerHTML = msgs.map((m) => `<div class="msg ${m.from}">${m.text ? esc(m.text) : '<span class="att">[attachment]</span>'}</div>`).join("") || "No messages stored.";
+  if (el) el.innerHTML = transcriptHtml(msgs);
 }
+
+// ---- auto-send: hold, countdown, timed refresh ----
+
+async function holdOne(id) {
+  await api("/api/drafts/hold", { method: "POST", body: { ids: [id] } }).catch((e) => toast(e.message));
+  loadChat();
+}
+
+// Clicking into a reply that's counting down holds it, so it can't go out mid-edit. No re-render: keep focus.
+async function holdOnEdit(id) {
+  const item = state.items.find((i) => i.draft_id === id);
+  if (!item || !item.auto_send_at) return;
+  item.auto_send_at = null; item.auto_send_held = true;
+  const badge = $(`body-${id}`).closest(".card").querySelector("[data-countdown]");
+  if (badge) { badge.nextElementSibling?.remove(); badge.outerHTML = `<span class="pill">auto-send held</span>`; }
+  await api("/api/drafts/hold", { method: "POST", body: { ids: [id] } }).catch((e) => toast(e.message));
+}
+
+// True while a refresh would throw away what the person is doing.
+function isBusy() {
+  if ($("send-dialog").open || $("cost-dialog").open) return true;
+  if (document.activeElement?.closest?.("#queue") && document.activeElement.tagName === "TEXTAREA") return true;
+  return state.items.some((i) => { const el = $(`body-${i.draft_id}`); return el && el.value.trim() !== (i.body || "").trim(); });
+}
+
+let lastDueLoad = 0;
+setInterval(() => {
+  let due = false;
+  document.querySelectorAll("[data-countdown]").forEach((el) => {
+    el.textContent = countdownText(el.dataset.countdown);
+    if (new Date(el.dataset.countdown) - Date.now() < -3000) due = true;   // the server sends within ~5s
+  });
+  if (due && Date.now() - lastDueLoad > 5000 && !$("chat").hidden && !isBusy()) { lastDueLoad = Date.now(); loadChat(); }
+}, 1000);
+
+setInterval(() => { if (!$("chat").hidden && !document.hidden && !isBusy()) loadChat(); }, REFRESH_MS);
 
 async function saveIfChanged(id) {
   const item = state.items.find((i) => i.draft_id === id);

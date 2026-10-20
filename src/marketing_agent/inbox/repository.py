@@ -93,8 +93,15 @@ class InboxRepository:
     def update_draft(self, message_id: int, **fields) -> None:
         self.db.update_message(message_id, **fields)
 
-    def approve(self, message_id: int) -> None:
-        self.db.approve_message(message_id)
+    def approve(self, message_id: int, *, by: str = "user") -> None:
+        self.db.approve_message(message_id, by=by)
+
+    def due_auto_sends(self, now: datetime) -> list[int]:
+        return [r["id"] for r in self.conn.execute(
+            f"""SELECT id FROM messages WHERE channel = 'instagram' AND kind = 'reply' AND auto_send_hold = 0
+                    AND auto_send_at IS NOT NULL AND auto_send_at <= ?
+                    AND status IN ({",".join("?" * len(OPEN_DRAFT_STATUSES))}) ORDER BY auto_send_at""",
+            (_iso(now), *OPEN_DRAFT_STATUSES))]
 
     # ---- FAQs -----------------------------------------------------------------
 
@@ -109,9 +116,17 @@ class InboxRepository:
         return self.conn.total_changes - before
 
     def faqs(self) -> list[FAQ]:
-        rows = self.conn.execute("SELECT * FROM faqs ORDER BY key").fetchall()
+        """FAQs with how many hand-approved drafts used the current answer unchanged."""
+        rows = self.conn.execute(
+            """SELECT f.*, (SELECT COUNT(*) FROM messages m
+                            WHERE m.channel = 'instagram' AND m.kind = 'reply' AND m.faq_key = f.key
+                              AND m.approved_at IS NOT NULL AND COALESCE(m.approved_by, 'user') = 'user'
+                              AND TRIM(m.body, char(32, 9, 10, 13)) = TRIM(f.answer, char(32, 9, 10, 13))
+                           ) AS approvals
+               FROM faqs f ORDER BY f.key""").fetchall()
         return [FAQ(key=r["key"], question=r["question"], answer=r["answer"],
-                    keywords=tuple(json.loads(r["keywords_json"])), approved=bool(r["approved"])) for r in rows]
+                    keywords=tuple(json.loads(r["keywords_json"])), approved=bool(r["approved"]),
+                    approvals=r["approvals"]) for r in rows]
 
     def faq(self, key: str) -> FAQ | None:
         return next((f for f in self.faqs() if f.key == key), None)
@@ -131,7 +146,11 @@ class InboxRepository:
 
     # ---- stats ----------------------------------------------------------------
 
-    def sent_replies_since(self, since: datetime) -> int:
-        return self.conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE channel = 'instagram' AND kind = 'reply' AND status = 'sent' "
-            "AND sent_at >= ?", (_iso(since),)).fetchone()[0]
+    def sent_replies_since(self, since: datetime, *, approved_by: str | None = None) -> int:
+        sql = ("SELECT COUNT(*) FROM messages WHERE channel = 'instagram' AND kind = 'reply' AND status = 'sent' "
+               "AND sent_at >= ?")
+        params: list = [_iso(since)]
+        if approved_by:
+            sql += " AND COALESCE(approved_by, 'user') = ?"
+            params.append(approved_by)
+        return self.conn.execute(sql, params).fetchone()[0]

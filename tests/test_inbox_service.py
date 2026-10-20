@@ -1,5 +1,7 @@
 """Service layer: drafting rules, priority, bulk actions and the send gates."""
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from conftest import US, ago, seed_chat
 
@@ -281,3 +283,162 @@ def test_earlier_buying_intent_still_raises_priority():
     low = score_thread(["where are you located?"], False, "where are you located?", 20)[0]
     warmer = score_thread(["where are you located?"], False, "I have the tech pack, just need a sample", 20)[0]
     assert warmer == low + 1
+
+
+# ---- auto-send of trusted FAQ answers -------------------------------------------------
+
+class Clock:
+    def __init__(self):
+        self.now = datetime.now(timezone.utc)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += timedelta(seconds=seconds)
+
+
+@pytest.fixture
+def auto(inbox):
+    """A service with a hand-driven clock and auto-send switched on."""
+    db, repo, _, ig = inbox
+    clock = Clock()
+    service = InboxService(repo, our_id=US, ig=ig, clock=clock)
+    service.set_auto_send(True)
+    return db, repo, service, ig, clock
+
+
+def _faq_draft(db, service, username="fan", igsid="1", text="where are you based?"):
+    seed_chat(db, f"c-{username}", igsid, username, [("them", text, 1)])
+    service.refresh_drafts()
+    return next(i.draft_id for i in service.queue() if i.username == username)
+
+
+def test_explicitly_approved_faq_answer_auto_sends_after_a_minute(auto):
+    db, repo, service, ig, clock = auto
+    service.approve_faq("location")
+    draft_id = _faq_draft(db, service)
+    assert repo.draft(draft_id)["auto_send_at"]
+    clock.advance(59)
+    assert service.run_auto_sends().sent == [] and ig.sent == []        # still inside the minute
+    clock.advance(2)
+    assert service.run_auto_sends().sent == [draft_id]
+    draft = repo.draft(draft_id)
+    assert draft["status"] == "sent" and draft["approved_by"] == "auto"
+    assert ig.sent == [("1", "We are based in Jaipur, we deliver pan India")]
+    assert repo.faq("location").approvals == 0                           # auto approvals don't build trust
+    assert service.stats()["auto_sent_24h"] == 1
+
+
+def test_three_hand_approvals_make_an_answer_trusted_and_editing_it_resets(auto):
+    db, repo, service, ig, clock = auto
+    for n in range(3):
+        draft_id = _faq_draft(db, service, f"u{n}", str(n))
+        assert not repo.draft(draft_id)["auto_send_at"]
+        service.approve([draft_id])
+    assert repo.faq("location").approvals == 3 and repo.faq("location").trusted
+    fourth = _faq_draft(db, service, "u3", "3")
+    assert repo.draft(fourth)["auto_send_at"]
+    service.edit_faq("location", "Jaipur! We ship pan India.")
+    assert repo.faq("location").approvals == 0 and not repo.faq("location").trusted
+    service.schedule_auto_sends()
+    assert not repo.draft(fourth)["auto_send_at"]
+
+
+def test_auto_send_is_off_by_default(inbox):
+    db, repo, service, ig = inbox
+    service.approve_faq("location")
+    draft_id = _faq_draft(db, service)
+    assert service.auto_send_enabled() is False and not repo.draft(draft_id)["auto_send_at"]
+
+
+def test_switching_auto_send_off_cancels_countdowns(auto):
+    db, repo, service, ig, clock = auto
+    service.approve_faq("location")
+    draft_id = _faq_draft(db, service)
+    assert repo.draft(draft_id)["auto_send_at"]
+    service.set_auto_send(False)
+    clock.advance(120)
+    assert not repo.draft(draft_id)["auto_send_at"] and service.run_auto_sends().sent == [] and ig.sent == []
+
+
+def test_editing_or_holding_stops_the_countdown(auto):
+    db, repo, service, ig, clock = auto
+    service.approve_faq("location")
+    edited = _faq_draft(db, service, "a", "1")
+    held = _faq_draft(db, service, "b", "2")
+    service.edit(edited, "We're in Jaipur - what are you looking to make?")
+    service.hold([held])
+    clock.advance(120)
+    assert service.run_auto_sends().sent == [] and ig.sent == []
+    assert repo.draft(held)["auto_send_hold"] == 1
+    service.edit(edited, "We are based in Jaipur, we deliver pan India")   # back to the trusted text
+    assert repo.draft(edited)["auto_send_at"] == (clock.now + timedelta(minutes=1)).isoformat(timespec="seconds")
+
+
+def test_manual_send_inside_the_minute_wins_and_nothing_is_sent_twice(auto):
+    db, repo, service, ig, clock = auto
+    service.approve_faq("location")
+    draft_id = _faq_draft(db, service)
+    service.approve([draft_id])
+    assert service.send([draft_id], confirm=True).sent == [draft_id]
+    clock.advance(120)
+    assert service.run_auto_sends().sent == [] and len(ig.sent) == 1
+
+
+def test_failed_auto_send_is_held_for_a_person(auto):
+    db, repo, service, ig, clock = auto
+    service.approve_faq("location")
+    draft_id = _faq_draft(db, service)
+    ig.fail_with = InstagramError("outside of allowed window", 10)
+    clock.advance(61)
+    assert service.run_auto_sends().failed == {draft_id: "outside of allowed window"}
+    draft = repo.draft(draft_id)
+    assert draft["auto_send_hold"] == 1 and draft["auto_send_at"] is None
+    ig.fail_with = None
+    clock.advance(61)
+    assert service.run_auto_sends().sent == []                           # no retry loop
+
+
+def test_answers_with_an_image_or_no_faq_never_auto_send(auto):
+    db, repo, service, ig, clock = auto
+    service.approve_faq("pricing")
+    seed_chat(db, "c1", "1", "ref", [("them", "price?", 1), ("them", None, 1)], attachment_at={1})
+    seed_chat(db, "c2", "2", "fan", [("them", "love your work", 1)])
+    service.refresh_drafts()
+    clock.advance(120)
+    assert service.run_auto_sends().sent == [] and all(not i.auto_send_at for i in service.queue())
+
+
+# ---- background jobs ----------------------------------------------------------------------
+
+def test_background_jobs_sync_at_start_then_on_schedule(inbox):
+    import time
+    db, repo, _, ig = inbox
+    ig.add_chat("c1", "1", "fan", [("them", "can I get a sample first?", 1)])
+    service = InboxService(repo, our_id=US, ig=ig)
+    service.start_background_jobs(sync_every=timedelta(minutes=15), tick=0.01)
+    try:
+        for _ in range(200):
+            if service.sync_state["last_finished"]:
+                break
+            time.sleep(0.01)
+    finally:
+        service.stop_background_jobs()
+    assert service.sync_state["last_finished"] and [i.username for i in service.queue()] == ["fan"]
+    next_run = datetime.fromisoformat(service.sync_state["next_run"])
+    assert timedelta(minutes=14) < next_run - datetime.now(timezone.utc) <= timedelta(minutes=15)
+
+
+def test_auto_send_checks_instagram_for_a_reply_typed_in_the_app(auto):
+    db, repo, service, ig, clock = auto
+    service.approve_faq("location")
+    ig.add_chat("c-fan", "1", "fan", [("them", "where are you based?", 1)])
+    service.sync()
+    [item] = service.queue()
+    # Answered from the Instagram app after the last sync: only Instagram knows.
+    ig.history["c-fan"].append({"id": "typed", "message": "Jaipur!", "from": {"id": US},
+                                "created_time": ago(-0.001).strftime("%Y-%m-%dT%H:%M:%S+0000")})
+    clock.advance(61)
+    result = service.run_auto_sends()
+    assert result.blocked == {item.draft_id: "answered in Instagram"} and ig.sent == []

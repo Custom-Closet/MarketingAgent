@@ -7,6 +7,8 @@ async function loadSettings() {
     settingsFaqs = faqs;
     $("st-window").value = s.context_window_days;
     $("st-lost").value = s.lost_after_days;
+    $("st-auto").checked = s.auto_send_faq;
+    $("st-auto-help").textContent = `Sends an unchanged trusted answer ${s.auto_send.delay_seconds}s after it's drafted, unless you edit, hold, dismiss or send it first. Needs the app running.`;
     const ok = (on, yes, no) => `<span class="pill ${on ? "ok" : "high"}">${on ? yes : no}</span>`;
     const a = s.archive, sync = s.status.sync;
     $("st-status").innerHTML = [
@@ -56,7 +58,7 @@ async function useModel() {
 
 async function saveSettings() {
   try {
-    await api("/api/settings", { method: "POST", body: { context_window_days: +$("st-window").value, lost_after_days: +$("st-lost").value } });
+    await api("/api/settings", { method: "POST", body: { context_window_days: +$("st-window").value, lost_after_days: +$("st-lost").value, auto_send_faq: $("st-auto").checked } });
     toast("Saved.");
   } catch (e) { toast(e.message); }
 }
@@ -66,7 +68,7 @@ function renderFaqs() {
     <div class="row"><h3>${esc(f.question)}</h3><span class="spacer"></span>
       ${f.approved ? `<span class="pill ok">approved</span> <button class="btn ghost" onclick="setFaqApproved('${esc(f.key)}', false)">Unapprove</button>`
         : `<button class="btn primary" onclick="setFaqApproved('${esc(f.key)}', true)">Approve</button>`}</div>
-    <div class="kw">Matches: ${esc(f.keywords.join(", "))}</div>
+    <div class="kw">Matches: ${esc(f.keywords.join(", "))} · approved unchanged in Chat ${f.approvals} ${f.approvals === 1 ? "time" : "times"}${f.trusted ? ` · <span class="pill ok">trusted - can auto-send</span>` : ""}</div>
     <textarea id="faq-${esc(f.key)}">${esc(f.answer)}</textarea>
     <div class="actions"><button class="btn" onclick="saveFaq('${esc(f.key)}')">Save answer</button></div>
   </div>`).join("") || `<div class="empty">No FAQs yet. Add them to faqs.json and restart.</div>`;

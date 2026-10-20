@@ -123,6 +123,7 @@
         <div class="panel"><h2>Drafting & funnel</h2>
           <div class="form-row"><label for="st-window">Days of chat Claude reads word for word<br><span class="muted" style="font-size:12px">Older messages are sent as a short summary</span></label><input type="number" id="st-window" min="1" max="60" style="width:80px"></div>
           <div class="form-row"><label for="st-lost">Mark a lead lost after (days of silence)</label><input type="number" id="st-lost" min="3" max="120" style="width:80px"></div>
+          <div class="form-row"><label for="st-auto">Auto-send trusted FAQ answers<br><span class="muted" style="font-size:12px" id="st-auto-help"></span></label><input type="checkbox" id="st-auto"></div>
           <button class="btn primary" onclick="saveSettings()">Save</button>
         </div>
       </div>
@@ -138,7 +139,7 @@
         <p class="stat" id="st-model-result"></p>
       </div>
       <h2 style="font-size:16px">FAQ answers</h2>
-      <p class="stat">Approved answers can be approved in bulk from Chat with one click. Editing an answer removes its approval until you approve it again.</p>
+      <p class="stat">Approved answers can be approved in bulk from Chat with one click. An answer is <b>trusted</b> once you approve it here or approve it unchanged in Chat 3 times; with auto-send on, trusted answers go out on their own after a minute unless you step in. Editing an answer removes its approval and resets its count.</p>
       <div id="faq-list"></div>
     </main>
   </section>

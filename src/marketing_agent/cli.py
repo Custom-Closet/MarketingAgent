@@ -407,7 +407,7 @@ def serve(
     from .inbox.repository import InboxRepository
     from dataclasses import replace
 
-    from .inbox.service import InboxService
+    from .inbox.service import SYNC_EVERY, InboxService
     from .insights.service import InsightsService
     from .insights.strategist import Strategist
     from .models import SETTING_KEY as MODEL_SETTING
@@ -452,6 +452,10 @@ def serve(
         lister=lambda: list_bedrock_text_models(settings.bedrock_region), on_switch=use_model)
     url = f"http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}"
     _log(f"Inbox at {url}  ({added} new FAQs loaded from {settings.faq_file}). Ctrl+C to stop.")
+    if service.ig is not None:
+        service.start_background_jobs()
+        _log(f"Checking Instagram now and every {int(SYNC_EVERY.total_seconds() // 60)} minutes. "
+             f"Auto-send of trusted FAQ answers is {'on' if service.auto_send_enabled() else 'off'} (Settings).")
     if open_browser:
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()
     uvicorn.run(create_app(service, insights, models), host=host, port=port, log_level="warning")

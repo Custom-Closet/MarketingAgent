@@ -52,6 +52,8 @@ textarea { width: 100%; font: inherit; padding: 8px 10px; border: 1px solid var(
 .pill.high { background: var(--high-bg); color: var(--high); }
 .pill.medium { background: var(--med-bg); color: var(--med); }
 .pill.ok { background: var(--ok-bg); color: var(--ok); }
+.pill.auto { background: var(--med-bg); color: var(--med); font-variant-numeric: tabular-nums; }
+button.btn.small { padding: 2px 8px; font-size: 13px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--accent); }
 dialog { border: 0; border-radius: 14px; padding: 0; width: min(640px, 94vw); box-shadow: 0 20px 60px rgba(0,0,0,.25); }

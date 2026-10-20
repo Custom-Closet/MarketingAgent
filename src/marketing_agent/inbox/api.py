@@ -11,7 +11,8 @@ from pydantic import BaseModel, Field
 
 from ..insights.service import InsightsService
 from ..models import ModelManager
-from .service import InboxService, QueueFilters, SendNotConfirmed
+from .faq import AUTO_SEND_AFTER_APPROVALS
+from .service import AUTO_SEND_DELAY, InboxService, QueueFilters, SendNotConfirmed
 
 STATIC = Path(__file__).parent / "static"
 
@@ -63,6 +64,7 @@ class ModelChoice(BaseModel):
 class SettingsUpdate(BaseModel):
     context_window_days: int | None = Field(None, ge=1, le=60)
     lost_after_days: int | None = Field(None, ge=3, le=120)
+    auto_send_faq: bool | None = None
 
 
 def _filters(priority: str | None, category: str | None, customer_type: str | None, status: str | None,
@@ -119,6 +121,11 @@ def create_app(service: InboxService, insights: InsightsService | None = None,
         ids = service.approve_faq_replies(_filters(priority, category, customer_type, None, max_hours_left, q))
         return {"approved": ids}
 
+    @app.post("/api/drafts/hold")
+    def hold(req: Ids):
+        guard(service.hold, req.ids)
+        return {"ok": True}
+
     @app.post("/api/drafts/reject")
     def reject(req: Ids):
         guard(service.reject, req.ids)
@@ -149,7 +156,7 @@ def create_app(service: InboxService, insights: InsightsService | None = None,
     @app.get("/api/faqs")
     def faqs():
         return [{"key": f.key, "question": f.question, "answer": f.answer, "keywords": list(f.keywords),
-                 "approved": f.approved} for f in service.faqs()]
+                 "approved": f.approved, "approvals": f.approvals, "trusted": f.trusted} for f in service.faqs()]
 
     @app.post("/api/faqs/{key}")
     def update_faq(key: str, req: FaqUpdate):
@@ -202,6 +209,9 @@ def create_app(service: InboxService, insights: InsightsService | None = None,
         return {
             "context_window_days": service.window_days(),
             "lost_after_days": insights.lost_after_days(),
+            "auto_send_faq": service.auto_send_enabled(),
+            "auto_send": {"delay_seconds": int(AUTO_SEND_DELAY.total_seconds()),
+                          "after_approvals": AUTO_SEND_AFTER_APPROVALS},
             "status": {"instagram": service.ig is not None, "claude_drafts": service.writer is not None,
                        "strategist": insights.strategist is not None, "sync": dict(service.sync_state)},
             "archive": {"conversations": counts[0], "messages": counts[1], "newest_message": counts[2],
@@ -240,6 +250,8 @@ def create_app(service: InboxService, insights: InsightsService | None = None,
                 service.repo.db.set_setting("context_window_days", str(req.context_window_days))
             if req.lost_after_days is not None:
                 service.repo.db.set_setting("lost_after_days", str(req.lost_after_days))
+            if req.auto_send_faq is not None:
+                service.set_auto_send(req.auto_send_faq)
         return {"ok": True}
 
     return app

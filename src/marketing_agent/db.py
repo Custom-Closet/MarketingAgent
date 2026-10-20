@@ -50,6 +50,9 @@ CREATE TABLE IF NOT EXISTS messages (
     approved_at     TEXT,
     reply_deadline  TEXT,              -- IG replies: last send time Meta allows (inbound + reply window)
     faq_key         TEXT,              -- IG replies: FAQ whose answer the draft started from
+    approved_by     TEXT,              -- user / auto (auto-sent trusted FAQ answer); NULL on older rows = user
+    auto_send_at    TEXT,              -- IG replies: when an unchanged trusted FAQ answer goes out on its own
+    auto_send_hold  INTEGER NOT NULL DEFAULT 0,  -- 1 = never auto-send this draft (held in the inbox, or a failed try)
     sent_at         TEXT
 );
 
@@ -148,9 +151,11 @@ class Database:
     def _migrate(self) -> None:
         """Add columns introduced after a database was first created."""
         have = {row["name"] for row in self.conn.execute("PRAGMA table_info(messages)")}
-        for column in ("approved_at", "reply_deadline", "faq_key"):
+        columns = {"approved_at": "TEXT", "reply_deadline": "TEXT", "faq_key": "TEXT", "approved_by": "TEXT",
+                   "auto_send_at": "TEXT", "auto_send_hold": "INTEGER NOT NULL DEFAULT 0"}
+        for column, kind in columns.items():
             if column not in have:
-                self.conn.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
+                self.conn.execute(f"ALTER TABLE messages ADD COLUMN {column} {kind}")
         self.conn.commit()
 
     # ---- leads -----------------------------------------------------------
@@ -260,8 +265,8 @@ class Database:
             params.append(limit)
         return self.conn.execute(sql, params).fetchall()
 
-    def approve_message(self, message_id: int) -> None:
-        self.update_message(message_id, status="approved", approved_at=now_iso())
+    def approve_message(self, message_id: int, *, by: str = "user") -> None:
+        self.update_message(message_id, status="approved", approved_at=now_iso(), approved_by=by)
 
     def replied_since(self, lead_id: int, since: str) -> bool:
         """True if an Instagram reply was already sent to this lead at or after `since`."""
