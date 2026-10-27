@@ -14,6 +14,7 @@ wheels/
 credentials.json
 data/
 *.log
+docs/
 
 # Business-specific content (contact details, prices) - templates are committed as *.example.*
 brand.md
