@@ -121,6 +121,9 @@ uv run agent find instagram -u cafeluna -u bluebottle --min-followers 5000
 uv run agent find instagram -t specialtycoffee           # accounts @-mentioned under a hashtag
 uv run agent find csv leads.csv                          # name,email,company,domain,ig_username,...
 uv run agent enrich                                      # Instagram website -> Hunter email
+uv run agent brands run                                  # today's emerging womenswear brands (USA + India)
+uv run agent brands seed muse.md                         # import brands found elsewhere (links, @handles or names)
+uv run agent brands list                                 # what has been delivered
 
 # 2. Draft with Claude, then review each draft
 uv run agent draft --channel email --limit 20
@@ -164,6 +167,14 @@ PYTHONPATH=src uv run --no-sync python -m marketing_agent.cli serve
 4. **Send approved** shows every message that will go out and sends only after you confirm. A reply is
    skipped if the window has closed, the customer was already answered in the Instagram app, or they
    unsubscribed. At most 25 per batch.
+
+5. **Settings › Brand profile** edits `brand.md`, the profile the model reads before every draft and
+   strategist answer. **Load the draft into the editor** brings in `brand.draft.md` (from
+   `agent build-brand`). **Tune with AI** proposes a revised profile and lists each change; nothing is
+   saved until you press Save. Every save is kept as a version you can reopen. New drafts use the
+   saved profile straight away. The Lambda run uses the copy bundled at deploy, so redeploy after
+   changing it. Whatever the profile says, drafts are written as the founder of a one-person business:
+   simple, humble, only facts from the profile, and "let me check" instead of a guess.
 
 Nothing is sent without approval and that final confirmation, with one opt-in exception:
 
@@ -227,6 +238,39 @@ object, downloads the database, works on it and uploads it. If the Lambda run is
 CLI commands wait for it and tell you to try again in a few minutes. S3 versioning keeps a backup
 of every run for 90 days.
 
+## Prospecting (Marketing › Prospecting in the app)
+
+Finds emerging womenswear brands in any country and tracks them until they buy. Open
+`uv run agent serve`, go to **Marketing › Prospecting** and press **Run search**. The search runs in the
+background (about 12 minutes) and prospects appear as they are verified. `uv run agent brands run`
+does the same from the terminal. Needs `SERPER_API_KEY` (or `BRAVE_SEARCH_API_KEY`) and the Instagram token.
+
+1. **Search setup:** the countries to search (any of the 249 ISO countries; USA and India to start),
+   each with its cities or states. **All states** fills in every state or province. Also keywords,
+   Indian-craft terms (searched outside India), extra queries, words to exclude, and limits: prospects
+   per run (all countries together) and at most so many from one country. Every keyword is searched
+   with every place (`site:instagram.com "small batch clothing" "Brooklyn"`), interleaved across
+   countries, about 100 searches a run. Each saved change is a version you can restore.
+2. **Tune the search with AI:** say what you want ("more Indian-owned labels in Texas"). The model reads
+   how each query performed (candidates, prospects, contacted) and why candidates were rejected, then
+   proposes a new setup. The cost is shown first, and nothing changes until you apply the proposal.
+3. **Verify:** every candidate is checked with Instagram's Business Discovery (followers, bio and last
+   posts, word for word). It must be under 10K followers, have 3–800 posts and a post in the last 60 days,
+   and be contemporary womenswear based in one of the searched countries. The country is read from the
+   bio (country, state and city names, flag emoji) and the website's domain (.in, .co.uk), else the model.
+4. **Work the prospects:** *Found → Shortlisted → Contacted* (or *Dismissed*). **Open DM** opens the
+   Instagram chat; cold DMs are always sent by you. A prospect becomes *Contacted* on its own once an
+   Instagram conversation with it exists.
+5. **To close:** once a prospect replies, its chat moves through the Sales funnel like any other lead,
+   under the source "Brand finder". **Sales › Prospecting → close** shows the whole path: found,
+   shortlisted, contacted, replied, qualified, quoted, order, won.
+
+Everything is stored in `agent.db`: `brand_candidates` (every handle checked, with its prospect stage),
+`brand_searches` (each run), `brand_search_queries` (each search and what it found) and
+`brand_search_configs` (setup versions).
+
+Only official APIs are used: web search APIs and the Instagram Graph API. Instagram is never scraped.
+
 ### Deploy
 
 Requires Node.js (for `npx aws-cdk`) and AWS credentials (`aws sts get-caller-identity`). Docker is not needed.
@@ -280,11 +324,17 @@ src/marketing_agent/
 ├── clients.py          # builds Gmail / Hunter / Instagram / Claude clients from settings
 ├── pipeline.py         # discover → enrich → draft → send → sync steps
 ├── daily.py            # the daily job + digest email
-├── lambda_handler.py   # Lambda entry point (loads secrets, runs daily.py)
+├── lambda_handler.py   # Lambda entry point (loads secrets, runs daily.py or the brand job)
 ├── personalize.py      # Claude drafting (structured outputs, cached brand prompt)
+├── brands/             # daily emerging-brand list
+│   ├── sweeps.py       # candidate sources: web search, brand sites, snowball, hashtags
+│   ├── criteria.py     # numeric checks, keyword rules, region and founder extraction
+│   ├── judge.py        # model check: contemporary womenswear? based where?
+│   └── finder.py       # orchestration, ledger, run file, delivery
 ├── sources/
 │   ├── hunter.py       # Hunter.io v2: domain search, email finder, verifier
-│   └── instagram.py    # Graph API: business discovery, hashtags, conversations, replies
+│   ├── instagram.py    # Graph API: business discovery, hashtags, conversations, replies
+│   └── web_search.py   # Brave / Serper search + Instagram handle parsing
 └── channels/
     └── gmail.py        # OAuth, MIME building, sending, thread/bounce inspection
 infra/app.py            # AWS CDK stack: Lambda, S3, Secrets Manager, schedule, alarm

@@ -44,3 +44,4 @@ def handler(event, context):
         # Fail the invocation so the CloudWatch alarm emails the team.
         raise RuntimeError("Daily run finished with errors: " + "; ".join(report.errors))
     return {"stats": report.stats, "replies": len(report.replies)}
+

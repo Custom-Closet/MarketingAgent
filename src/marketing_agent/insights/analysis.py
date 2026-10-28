@@ -23,7 +23,8 @@ REASON_LABELS = {
     "declined": "Said no / not now", "went_quiet": "Went quiet",
 }
 SOURCE_LABELS = {"ad_price_tap": "Ad / post price tap", "brand_keyword": "BRAND keyword",
-                 "faq_button": "FAQ button", "direct_message": "Typed message", "outreach": "Our outreach"}
+                 "faq_button": "FAQ button", "direct_message": "Typed message", "outreach": "Our outreach",
+                 "brand_finder": "Brand finder (prospecting)"}
 
 CANNED_MIN_COUNT = 4
 AUTO_REPLY_SECONDS = 90           # a reply this fast is an auto-response, not a person

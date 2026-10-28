@@ -21,6 +21,7 @@ async function loadSettings() {
     ].join("");
     renderFaqs();
     loadModels(false);
+    loadBrand();
   } catch (e) { toast("Couldn't load settings: " + e.message); }
 }
 

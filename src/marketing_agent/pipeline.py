@@ -97,6 +97,8 @@ def process_targets(db: Database, settings: Settings, *, limit: int, hunter: Hun
             elif target["kind"] == "ig_user":
                 added = discover_instagram(db, ig, {target["value"]}, log=log)
             else:
+                # Counts towards Meta's 30 hashtags / 7 days, shared with the brand finder.
+                db.record_hashtag(target["value"], datetime.now(timezone.utc) - timedelta(days=7))
                 added = discover_instagram(db, ig, ig.hashtag_mentions(target["value"]), log=log)
             db.finish_target(target["id"], "done", f"{added} leads")
         except (HunterError, InstagramError) as exc:

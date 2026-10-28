@@ -9,8 +9,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from ..brand_profile import BrandProfileService
+from ..brands import geo
+from ..brands.config import SearchConfig
 from ..insights.service import InsightsService
 from ..models import ModelManager
+from ..prospecting.service import ProspectingService
 from .faq import AUTO_SEND_AFTER_APPROVALS
 from .service import AUTO_SEND_DELAY, InboxService, QueueFilters, SendNotConfirmed
 
@@ -57,6 +61,35 @@ class StrategyRequest(BaseModel):
     confirm: bool = False
 
 
+class ConfigUpdate(BaseModel):
+    config: SearchConfig
+    note: str = ""
+    created_by: str = Field("user", pattern="^(user|ai)$")
+
+
+class TuneRequest(BaseModel):
+    message: str
+    history: list[Turn] = []
+    confirm: bool = False
+
+
+class BrandSave(BaseModel):
+    content: str
+    note: str = ""
+    created_by: str = Field("user", pattern="^(user|ai)$")
+
+
+class BrandTune(BaseModel):
+    content: str
+    message: str
+    history: list[Turn] = []
+    confirm: bool = False
+
+
+class ProspectStage(BaseModel):
+    stage: str
+
+
 class ModelChoice(BaseModel):
     model_id: str
 
@@ -75,10 +108,20 @@ def _filters(priority: str | None, category: str | None, customer_type: str | No
 
 
 def create_app(service: InboxService, insights: InsightsService | None = None,
-               models: ModelManager | None = None) -> FastAPI:
+               models: ModelManager | None = None, prospecting: ProspectingService | None = None,
+               brand: BrandProfileService | None = None) -> FastAPI:
     app = FastAPI(title="Custom Closet", docs_url="/api/docs")
     insights = insights or InsightsService(service.repo.db, our_id=service.our_id, lock=service.lock)
+    prospecting = prospecting or ProspectingService(service.repo.db, lock=service.lock)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+    @app.middleware("http")
+    async def revalidate_page(request, call_next):
+        # Without this, browsers keep using an old page or script after the app is updated and restarted.
+        response = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
     def guard(fn, *args, **kwargs):
         try:
@@ -199,6 +242,72 @@ def create_app(service: InboxService, insights: InsightsService | None = None,
     def marketing(days: int = Query(90, ge=7, le=365)):
         return insights.marketing(days=days)
 
+    # ---- marketing > prospecting ----------------------------------------------------------
+
+    @app.get("/api/prospecting/config")
+    def prospecting_config():
+        config, config_id = prospecting.config()
+        return {"config": config.model_dump(), "id": config_id, "history": prospecting.config_history()}
+
+    @app.post("/api/prospecting/config")
+    def save_prospecting_config(req: ConfigUpdate):
+        return {"id": guard(prospecting.save_config, req.config, note=req.note, created_by=req.created_by)}
+
+    @app.post("/api/prospecting/config/{config_id}/restore")
+    def restore_prospecting_config(config_id: int):
+        return {"id": guard(prospecting.revert, config_id)}
+
+    @app.get("/api/prospecting/countries")
+    def countries():
+        return geo.countries()
+
+    @app.get("/api/prospecting/countries/{code}/states")
+    def states(code: str):
+        if len(code) != 2:
+            raise HTTPException(404, "unknown country")
+        return {"code": code.lower(), "name": geo.country_name(code), "states": geo.states(code)}
+
+    @app.post("/api/prospecting/search")
+    def start_search():
+        return {"search_id": guard(prospecting.start_search)}
+
+    @app.get("/api/prospecting/status")
+    def search_status():
+        return prospecting.status()
+
+    @app.get("/api/prospecting/searches")
+    def searches():
+        return prospecting.searches()
+
+    @app.get("/api/prospecting/queries")
+    def query_stats():
+        return prospecting.query_stats()
+
+    @app.post("/api/prospecting/tune/estimate")
+    def tune_estimate(req: TuneRequest):
+        return guard(prospecting.tune_estimate, req.message, [t.model_dump() for t in req.history])
+
+    @app.post("/api/prospecting/tune")
+    def tune(req: TuneRequest):
+        return guard(prospecting.tune, req.message, [t.model_dump() for t in req.history], confirm=req.confirm)
+
+    @app.get("/api/prospects")
+    def prospects(stage: str | None = None, region: str | None = None, q: str | None = None,
+                  search_id: int | None = None):
+        rows = prospecting.prospects(stage=stage or None, region=region or None, search=q or None,
+                                     search_id=search_id)
+        convos = insights.prospect_conversations()
+        return [{**r, "funnel": convos.get(r["username"])} for r in rows]
+
+    @app.post("/api/prospects/{username}/stage")
+    def set_prospect_stage(username: str, req: ProspectStage):
+        guard(prospecting.set_stage, username, req.stage)
+        return {"ok": True}
+
+    @app.get("/api/prospects/funnel")
+    def prospect_funnel():
+        return insights.prospect_funnel()
+
     # ---- settings -------------------------------------------------------------------------
 
     @app.get("/api/settings")
@@ -217,6 +326,42 @@ def create_app(service: InboxService, insights: InsightsService | None = None,
             "archive": {"conversations": counts[0], "messages": counts[1], "newest_message": counts[2],
                         "summaries": counts[3]},
         }
+
+    # ---- settings > brand profile (brand.md) ------------------------------------------------
+
+    def require_brand() -> BrandProfileService:
+        if brand is None:
+            raise HTTPException(503, "Brand profile editing isn't available")
+        return brand
+
+    @app.get("/api/brand")
+    def brand_state():
+        return require_brand().state()
+
+    @app.post("/api/brand")
+    def save_brand(req: BrandSave):
+        return {"version": guard(require_brand().save, req.content, note=req.note, created_by=req.created_by)}
+
+    @app.get("/api/brand/draft")
+    def brand_draft():
+        return {"content": guard(require_brand().draft)}
+
+    @app.get("/api/brand/versions/{version_id}")
+    def brand_version(version_id: int):
+        return {"content": guard(require_brand().version, version_id)}
+
+    @app.post("/api/brand/versions/{version_id}/restore")
+    def restore_brand(version_id: int):
+        return {"version": guard(require_brand().restore, version_id)}
+
+    @app.post("/api/brand/tune/estimate")
+    def brand_tune_estimate(req: BrandTune):
+        return guard(require_brand().tune_estimate, req.content, req.message, [t.model_dump() for t in req.history])
+
+    @app.post("/api/brand/tune")
+    def brand_tune(req: BrandTune):
+        return guard(require_brand().tune, req.content, req.message, [t.model_dump() for t in req.history],
+                     confirm=req.confirm)
 
     # ---- model (Bedrock) ---------------------------------------------------------------
 

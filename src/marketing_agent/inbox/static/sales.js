@@ -22,6 +22,20 @@ async function loadSales() {
   renderSources(report.by_source);
   renderPresets();
   loadBoard();
+  loadProspectFunnel();
+}
+
+async function loadProspectFunnel() {
+  const f = await api("/api/prospects/funnel").catch(() => null);
+  if (!f) return;
+  const max = Math.max(1, f.steps[0].reached);
+  $("s-prospect-sub").textContent = `Brands found by Marketing › Prospecting, from search to close · ${fmt(f.dismissed)} dismissed, ${fmt(f.lost)} lost after replying`;
+  $("s-prospect").innerHTML = f.steps[0].reached ? f.steps.map((s) => `
+    <div class="name">${esc(s.label)}</div>
+    <div class="track" data-tip="${esc(s.label)}: ${fmt(s.reached)} brands${s.conversion !== null ? ` · ${s.conversion}% of the previous step` : ""}">
+      <div class="fill" style="width:${(100 * s.reached / max).toFixed(2)}%"></div></div>
+    <div class="val">${fmt(s.reached)}${s.conversion !== null ? ` <span class="muted">${s.conversion}%</span>` : ""}</div>`).join("")
+    : `<div class="muted">No prospects yet. Run a search in <a href="#marketing/prospecting" onclick="go('marketing/prospecting'); return false">Marketing › Prospecting</a>.</div>`;
 }
 
 function renderSourceFilter(r) {
@@ -184,13 +198,11 @@ async function askStrategist() {
   try {
     const est = await api("/api/strategy/estimate", { method: "POST", body: { question, history: sales.history, days: +$("s-days").value } });
     sales.pending = question;
-    $("cost-text").textContent = `This sends your funnel numbers and a few anonymised lost chats (~${fmt(est.input_tokens)} tokens) to Claude. Estimated cost: ${est.usd === null ? "unknown" : "$" + est.usd.toFixed(3)}.`;
-    $("cost-dialog").showModal();
+    askCost(costText("your funnel numbers and a few anonymised lost chats", est), confirmStrategist);
   } catch (e) { toast(e.message); }
 }
 
 async function confirmStrategist() {
-  $("cost-dialog").close();
   const question = sales.pending;
   const btn = $("s-ask"); btn.disabled = true; btn.textContent = "Thinking…";
   try {

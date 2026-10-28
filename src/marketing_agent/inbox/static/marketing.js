@@ -1,4 +1,4 @@
-// Marketing module: outreach template performance and lead-source quality.
+// Marketing module, Overview tab: outreach template performance and lead-source quality.
 async function loadMarketing() {
   let m;
   try { m = await api("/api/marketing?days=" + $("m-days").value); } catch (e) { toast("Couldn't load marketing: " + e.message); return; }
@@ -18,4 +18,13 @@ async function loadMarketing() {
       <td>${rateCell(s.order_rate)}</td><td class="num">${fmt(s.won)}</td></tr>`).join("")}</tbody></table>`;
 }
 
-loaders.marketing = loadMarketing;
+// Marketing has sub-pages (Overview, Prospecting); controls marked data-sub-only show on one of them.
+function showMarketing(sub) {
+  sub = sub === "prospecting" ? "prospecting" : "overview";
+  document.querySelectorAll("#marketing .subpage").forEach((p) => (p.hidden = p.dataset.sub !== sub));
+  document.querySelectorAll("#marketing .tab").forEach((t) => t.classList.toggle("active", t.dataset.sub === sub));
+  document.querySelectorAll("#marketing [data-sub-only]").forEach((el) => (el.hidden = el.dataset.subOnly !== sub));
+  if (sub === "prospecting") loadProspecting(); else loadMarketing();
+}
+
+loaders.marketing = showMarketing;

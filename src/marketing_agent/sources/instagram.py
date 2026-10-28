@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 from urllib.parse import urlparse
@@ -86,6 +86,7 @@ class IGProfile:
     website: str | None
     followers_count: int | None
     media_count: int | None
+    recent_media: list[dict[str, Any]] = field(default_factory=list)   # [{timestamp, caption}], newest first
 
     @property
     def domain(self) -> str | None:
@@ -172,11 +173,15 @@ class InstagramClient:
 
     # ---- discovery -------------------------------------------------------
 
-    def business_discovery(self, username: str) -> IGProfile:
-        """Public profile of a business/creator account. Personal accounts are not visible."""
+    def business_discovery(self, username: str, *, media_limit: int = 0) -> IGProfile:
+        """Public profile of a business/creator account. Personal accounts are not visible.
+
+        `media_limit` > 0 also returns that many recent posts (timestamp + caption) in the same call.
+        """
         username = username.lstrip("@")
+        media = f",media.limit({media_limit}){{timestamp,caption}}" if media_limit else ""
         fields = (f"business_discovery.username({username})"
-                  "{username,name,biography,website,followers_count,media_count}")
+                  f"{{username,name,biography,website,followers_count,media_count{media}}}")
         data = self._request("GET", f"/{self.ig_user_id}", params={"fields": fields})["business_discovery"]
         return IGProfile(
             username=data["username"],
@@ -185,7 +190,32 @@ class InstagramClient:
             website=data.get("website"),
             followers_count=data.get("followers_count"),
             media_count=data.get("media_count"),
+            recent_media=(data.get("media") or {}).get("data", []),
         )
+
+    def hashtag_captions(self, hashtag: str, *, edges: tuple[str, ...] = ("recent_media", "top_media"),
+                         pages: int = 2, page_size: int = 10) -> list[str]:
+        """Captions of recent and top posts for a hashtag, a few small pages per edge.
+
+        Meta rejects large hashtag pages ("reduce the amount of data"), so pages stay small.
+        Each new hashtag counts towards the 30-unique-hashtags-per-7-days limit.
+        """
+        found = self._request("GET", "/ig_hashtag_search",
+                              params={"user_id": self.ig_user_id, "q": hashtag.lstrip("#")})
+        if not found.get("data"):
+            return []
+        hashtag_id = found["data"][0]["id"]
+        captions: list[str] = []
+        for edge in edges:
+            params: dict[str, Any] = {"user_id": self.ig_user_id, "fields": "caption", "limit": page_size}
+            for _ in range(pages):
+                page = self._request("GET", f"/{hashtag_id}/{edge}", params=params)
+                captions += [item["caption"] for item in page.get("data", []) if item.get("caption")]
+                after = page.get("paging", {}).get("cursors", {}).get("after")
+                if not after or len(page.get("data", [])) < page_size:
+                    break
+                params = {**params, "after": after}
+        return captions
 
     def hashtag_mentions(self, hashtag: str, *, limit: int = 50) -> set[str]:
         """Usernames @-mentioned in recent posts for a hashtag.

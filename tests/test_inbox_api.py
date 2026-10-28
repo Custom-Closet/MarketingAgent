@@ -22,6 +22,9 @@ def test_index_page_is_served(client):
     assert res.status_code == 200 and "Custom Closet" in res.text
     for asset in ("app.css", "common.js", "chat.js", "sales.js", "marketing.js", "settings.js"):
         assert http.get(f"/static/{asset}").status_code == 200
+    # Pages and scripts are revalidated, so an updated app shows up after a restart.
+    assert res.headers["cache-control"] == "no-cache"
+    assert http.get("/static/settings.js").headers["cache-control"] == "no-cache"
 
 
 def test_queue_and_filters(client):

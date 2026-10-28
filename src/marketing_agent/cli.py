@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 from contextlib import ExitStack
 import shutil
 import subprocess
@@ -24,8 +25,10 @@ from .storage import LockBusy, open_database
 app = typer.Typer(help="Lead discovery and approved-outreach agent for Gmail and Instagram.", no_args_is_help=True)
 find_app = typer.Typer(help="Discover new leads.", no_args_is_help=True)
 targets_app = typer.Typer(help="Queue discovery targets for the daily run.", no_args_is_help=True)
+brands_app = typer.Typer(help="Daily list of emerging womenswear brands (USA + India).", no_args_is_help=True)
 app.add_typer(find_app, name="find")
 app.add_typer(targets_app, name="targets")
+app.add_typer(brands_app, name="brands")
 console = Console()
 
 # Resources (the database) opened by a command; closed - and uploaded to S3 - when the command ends.
@@ -219,6 +222,92 @@ def targets_list() -> None:
     table = Table("Kind", "Value", "Status", "Result")
     for t in db.targets():
         table.add_row(t["kind"], t["value"], t["status"], t["result"] or "")
+    console.print(table)
+
+
+# ---- brand finder --------------------------------------------------------
+
+@brands_app.command("run")
+def brands_run(
+    country: Optional[str] = typer.Option(None, help="Country codes, e.g. us,in,gb (default: the app's search setup)"),
+    per_country: Optional[int] = typer.Option(None, help="Brands per country (default: the search setup)"),
+    minutes: float = typer.Option(14, help="Time budget for the run"),
+    email: bool = typer.Option(True, help="Email the list to DIGEST_EMAIL"),
+    model: bool = typer.Option(True, help="Let the model judge fit and region (else keywords only)"),
+) -> None:
+    """Find today's brands: search + snowball + hashtag sweeps, verified with Business Discovery."""
+    import time
+
+    from . import brands
+
+    countries = tuple(c.strip().lower() for c in country.split(",") if c.strip()) if country else None
+    if countries and any(len(c) != 2 for c in countries):
+        raise typer.BadParameter("use 2-letter country codes, e.g. us,in,gb")
+    settings, db = _ctx()
+    search = brands.search_client(settings)
+    if search is None:
+        _log("[yellow]No BRAVE_SEARCH_API_KEY / SERPER_API_KEY: skipping web search sweeps.[/yellow]")
+    llm = clients.llm(settings) if model and clients.llm_configured(settings) else None
+    run = brands.run_job(settings, db, ig=_instagram(settings), search=search, llm=llm,
+                         gmail=_gmail(settings) if email else None, per_country=per_country, countries=countries,
+                         deadline=time.monotonic() + minutes * 60, log=_log)
+    console.print(brands.render(run)[1], highlight=False)
+
+
+def _seed_entries(path: Path) -> list[tuple[str | None, str]]:
+    """(handle or None, name) per line of a list from another tool: IG links, @handles, or brand names."""
+    from .sources.web_search import handle_from_instagram_url
+
+    entries = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip().lstrip("-*0123456789.) ").strip()
+        if not line or line.startswith("#"):
+            continue
+        handle = handle_from_instagram_url(line)
+        if not handle and (m := re.search(r"(?<![\w.])@([A-Za-z0-9_.]{1,30})", line)):
+            handle = m.group(1).lower().rstrip(".")
+        name = re.split(r"\s+[—–|-]\s+|\t|,", line)[0].strip(" *_")
+        entries.append((handle, name))
+    return entries
+
+
+@brands_app.command("seed")
+def brands_seed(
+    path: Path = typer.Argument(..., help="Text/Markdown/CSV list: Instagram links, @handles or brand names"),
+    source: str = typer.Option("", help="Label stored with them (default: the file name)"),
+) -> None:
+    """Import brands found elsewhere: never delivered again, and mined for similar brands (snowball)."""
+    from . import brands
+    from .sources.web_search import handle_from_instagram_url
+
+    settings, db = _ctx()
+    search = brands.search_client(settings)
+    added, unresolved = 0, []
+    for handle, name in _seed_entries(path):
+        if not handle and search and name:
+            hits = search.search(f'site:instagram.com "{name}"', count=5)
+            handle = next((h for h in (handle_from_instagram_url(r.url) for r in hits) if h), None)
+        if not handle:
+            unresolved.append(name)
+            continue
+        if not db.brand_candidate(handle):
+            db.save_brand_candidate(handle, "known", name=name or None, reason=f"seed: {source or path.name}",
+                                    sources="seed")
+            added += 1
+    _log(f"{added} brands added to the ledger.")
+    if unresolved:
+        hint = "" if search else " (set BRAVE_SEARCH_API_KEY or SERPER_API_KEY to look names up)"
+        _log(f"[yellow]No Instagram handle for {len(unresolved)}{hint}:[/yellow] " + ", ".join(unresolved[:20]))
+
+
+@brands_app.command("list")
+def brands_list(day: Optional[str] = typer.Option(None, "--date", help="Run date YYYY-MM-DD (default: recent)")) -> None:
+    """Show delivered brands."""
+    _, db = _ctx()
+    table = Table("Date", "Region", "Brand", "Instagram", "Followers", "Founder", "Website")
+    for r in db.brand_leads(delivered_on=day):
+        table.add_row(r["delivered_on"], r["region"] or "", r["name"] or "", f"instagram.com/{r['username']}",
+                      str(r["followers"] or ""), r["founder"] or "", r["website"] or "")
     console.print(table)
 
 
@@ -439,12 +528,34 @@ def serve(
     service.refresh_drafts()
     strategist = Strategist(settings.brand_file.read_text(), llm=writer.llm) if writer else None
     insights = InsightsService(db, our_id=settings.ig_user_id, lock=service.lock, strategist=strategist)
+    from . import brands
+    from .prospecting.service import ProspectingService
+    prospecting = ProspectingService(
+        db, lock=service.lock, ig_factory=lambda: clients.instagram_client(settings),
+        search_factory=lambda: brands.search_client(settings),
+        llm_getter=lambda: service.writer.llm if service.writer else None,   # follows the model picked in Settings
+        run_db_factory=lambda: Database(settings.db_path, check_same_thread=False))
 
     def use_model(llm) -> None:
         if not settings.brand_file.exists():
             raise ValueError("brand.md not found - create it before drafting")
         service.writer = Personalizer(settings.brand_file, llm=llm)
         insights.strategist = Strategist(settings.brand_file.read_text(), llm=llm)
+
+    from .brand_profile import BrandProfileService
+
+    def current_llm():
+        if service.writer:
+            return service.writer.llm                  # the model picked in Settings
+        return clients.llm(settings) if clients.llm_configured(settings) else None
+
+    def reload_brand() -> None:
+        """A saved brand.md takes effect for the next draft and strategist answer."""
+        if (llm := current_llm()) is not None:
+            use_model(llm)
+
+    brand = BrandProfileService(db, settings.brand_file, lock=service.lock, llm_getter=current_llm,
+                                on_change=reload_brand)
 
     models = ModelManager(
         db, provider=settings.llm_provider, default_model=settings.bedrock_model_id,
@@ -458,7 +569,7 @@ def serve(
              f"Auto-send of trusted FAQ answers is {'on' if service.auto_send_enabled() else 'off'} (Settings).")
     if open_browser:
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()
-    uvicorn.run(create_app(service, insights, models), host=host, port=port, log_level="warning")
+    uvicorn.run(create_app(service, insights, models, prospecting, brand), host=host, port=port, log_level="warning")
 
 
 # ---- tracking ------------------------------------------------------------

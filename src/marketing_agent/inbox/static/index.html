@@ -77,6 +77,7 @@
         <div class="panel"><h2>Funnel</h2><p class="sub">Leads that reached each stage · % = share of the previous stage. Click a stage to list its leads.</p><div class="hbars" id="s-funnel"></div></div>
         <div class="panel"><h2>Why leads were lost</h2><p class="sub" id="s-lost-sub"></p><div class="hbars" id="s-drop"></div></div>
       </div>
+      <div class="panel" style="margin-bottom:14px"><h2>Prospecting → close</h2><p class="sub" id="s-prospect-sub"></p><div class="hbars" id="s-prospect"></div></div>
       <div class="grid">
         <div class="panel"><h2>New leads per week</h2><p class="sub">Conversations started, by week (Monday)</p><div class="cols" id="s-weekly"></div></div>
         <div class="panel"><h2>Lead sources</h2><p class="sub">How leads arrive and how often they reach a quote or an order</p><div class="table-wrap" id="s-sources"></div></div>
@@ -104,13 +105,79 @@
   <!-- ======================= MARKETING ======================= -->
   <section id="marketing" data-title="Marketing" hidden>
     <div class="topbar">
-      <h1>Marketing</h1><div class="spacer"></div>
-      <select id="m-days" onchange="loadMarketing()"><option value="30">Last 30 days</option><option value="60">Last 60 days</option><option value="90" selected>Last 90 days</option></select>
+      <h1>Marketing</h1>
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" data-sub="overview" onclick="go('marketing/overview')">Overview</button>
+        <button class="tab" role="tab" data-sub="prospecting" onclick="go('marketing/prospecting')">Prospecting</button>
+      </div>
+      <div class="spacer"></div>
+      <select id="m-days" onchange="loadMarketing()" data-sub-only="overview"><option value="30">Last 30 days</option><option value="60">Last 60 days</option><option value="90" selected>Last 90 days</option></select>
+      <button class="btn primary" id="p-run" onclick="startSearch()" data-sub-only="prospecting">Run search</button>
     </div>
     <main>
-      <div class="tiles" id="m-tiles"></div>
-      <div class="panel" style="margin-bottom:14px"><h2>Outreach messages</h2><p class="sub">Each opening message we sent first. "Real replies" exclude other brands' instant auto-responses.</p><div class="table-wrap" id="m-templates"></div></div>
-      <div class="panel"><h2>Where leads come from</h2><p class="sub">Every source, with how often it reaches a quote or an order</p><div class="table-wrap" id="m-sources"></div></div>
+      <div class="subpage" data-sub="overview">
+        <div class="tiles" id="m-tiles"></div>
+        <div class="panel" style="margin-bottom:14px"><h2>Outreach messages</h2><p class="sub">Each opening message we sent first. "Real replies" exclude other brands' instant auto-responses.</p><div class="table-wrap" id="m-templates"></div></div>
+        <div class="panel"><h2>Where leads come from</h2><p class="sub">Every source, with how often it reaches a quote or an order</p><div class="table-wrap" id="m-sources"></div></div>
+      </div>
+
+      <div class="subpage" data-sub="prospecting" hidden>
+        <div class="tiles" id="p-tiles"></div>
+        <div class="panel" style="margin-bottom:14px" id="p-run-panel" hidden>
+          <div class="row"><h2 style="margin:0">Search running</h2><span class="spacer"></span><span class="stat" id="p-run-state"></span></div>
+          <pre class="log" id="p-log"></pre>
+        </div>
+
+        <div class="panel" style="margin-bottom:14px">
+          <div class="row"><h2 style="margin:0">Prospects</h2><span class="spacer"></span>
+            <select id="p-stage" onchange="loadProspects()"><option value="">All stages</option><option value="found">Found</option><option value="shortlisted">Shortlisted</option><option value="contacted">Contacted</option><option value="dismissed">Dismissed</option></select>
+            <select id="p-region" onchange="loadProspects()"><option value="">All countries</option></select>
+            <select id="p-run-filter" onchange="loadProspects()"><option value="">All searches</option></select>
+            <input type="search" id="p-q" placeholder="Search brand or bio" oninput="debouncedProspects()"></div>
+          <p class="sub" style="margin-top:6px">Verified brands under 10K followers, active in the last 60 days. Shortlist the ones worth a DM, open the DM, then mark them <b>Contacted</b>. Once they reply, their chat moves through the Sales funnel.</p>
+          <div class="table-wrap" id="p-prospects"></div>
+        </div>
+
+        <div class="grid">
+          <div class="panel">
+            <h2>Search setup</h2>
+            <p class="sub">One per line. Every keyword is searched with every place; craft terms are searched with places outside India. <span id="p-size"></span></p>
+            <div class="row" style="margin-bottom:6px"><b style="font-size:14px">Countries</b><span class="spacer"></span>
+              <input type="search" id="p-add-country" list="p-country-list" placeholder="Add any country…" style="width:200px" onkeydown="if (event.key === 'Enter') addCountry()">
+              <datalist id="p-country-list"></datalist><button class="btn" onclick="addCountry()">Add</button></div>
+            <div class="targets" id="p-targets"></div>
+            <div class="setup">
+              <label>Keywords<textarea id="p-keywords" rows="6" oninput="previewSize()"></textarea></label>
+              <label>Extra queries (run every time, as written)<textarea id="p-extra" rows="3"></textarea></label>
+              <label>Indian craft / founder terms (outside India)<textarea id="p-terms" rows="4" oninput="previewSize()"></textarea></label>
+              <label>Exclude words<textarea id="p-exclude" rows="4"></textarea></label>
+            </div>
+            <div class="form-row"><label for="p-per-run">Prospects per run (all countries)</label><input type="number" id="p-per-run" min="1" max="500" style="width:80px"></div>
+            <div class="form-row"><label for="p-per-country">At most from one country</label><input type="number" id="p-per-country" min="1" max="500" style="width:80px"></div>
+            <div class="form-row"><label for="p-queries">Searches per run</label><input type="number" id="p-queries" min="1" max="500" style="width:80px"></div>
+            <div class="form-row"><label for="p-lookups">Instagram profile checks per run</label><input type="number" id="p-lookups" min="10" max="1000" style="width:80px"></div>
+            <div class="form-row"><label for="p-minutes">Time limit (minutes)</label><input type="number" id="p-minutes" min="2" max="60" style="width:80px"></div>
+            <div class="row"><button class="btn primary" onclick="saveSetup()">Save setup</button>
+              <span class="spacer"></span><select id="p-history"></select><button class="btn" onclick="restoreSetup()">Restore</button></div>
+          </div>
+
+          <div class="panel">
+            <h2>Tune the search with AI</h2>
+            <p class="sub">Say what you want more or less of. The model reads how each query performed and proposes a new setup; nothing changes until you apply it. Shows the cost first.</p>
+            <div class="presets" id="p-presets"></div>
+            <div class="chatlog" id="p-chat"></div>
+            <div class="proposal" id="p-proposal" hidden></div>
+            <textarea id="p-message" placeholder="e.g. Find more Indian-owned labels in Texas and New Jersey, skip swimwear"></textarea>
+            <div class="actions"><button class="btn primary" id="p-ask" onclick="askTuner()">Ask</button>
+              <button class="btn ghost" onclick="resetTuner()">New conversation</button></div>
+          </div>
+        </div>
+
+        <div class="grid">
+          <div class="panel"><h2>Recent searches</h2><div class="table-wrap" id="p-searches"></div></div>
+          <div class="panel"><h2>How each query performs</h2><p class="sub">Prospects found per query, best first. The AI tuner reads this table.</p><div class="table-wrap" id="p-queries-table"></div></div>
+        </div>
+      </div>
     </main>
   </section>
 
@@ -138,6 +205,36 @@
         </div>
         <p class="stat" id="st-model-result"></p>
       </div>
+      <div class="panel" style="margin-bottom:14px" id="st-brand-panel">
+        <div class="row"><h2 style="margin:0">Brand profile</h2><span class="muted" style="font-size:13px" id="st-brand-meta"></span></div>
+        <p class="sub" style="margin-top:4px">What the model knows about the business: it reads this before every reply draft and strategist answer.
+          Drafts always follow the founder's voice (simple, humble, only the truth) on top of what's written here.</p>
+        <div class="banner" id="st-brand-draft-banner" hidden>
+          <span>Your profile is still the empty template. A draft built from your real chats is ready (<code>brand.draft.md</code>), so review its <b>Needs confirmation</b> list before saving.</span>
+          <div class="spacer"></div><button class="btn primary" onclick="loadBrandDraft()">Load the draft into the editor</button></div>
+        <div class="grid brand-grid">
+          <div>
+            <textarea id="st-brand" class="code" rows="26" spellcheck="false" oninput="brandEdited()"></textarea>
+            <div class="row" style="margin-top:8px">
+              <button class="btn primary" onclick="saveBrand()">Save</button>
+              <button class="btn ghost" id="st-brand-revert" onclick="revertBrandEditor()" hidden>Undo unsaved changes</button>
+              <span class="stat" id="st-brand-dirty"></span><span class="spacer"></span>
+              <button class="btn" onclick="loadBrandDraft()" id="st-brand-draft-btn" hidden>Load brand.draft.md</button>
+              <select id="st-brand-versions"></select><button class="btn" onclick="viewBrandVersion()">Open</button>
+            </div>
+          </div>
+          <div>
+            <h3 style="font-size:14px;margin:0 0 4px">Tune with AI</h3>
+            <p class="sub">Say what to change. The model edits the text in the editor and lists each change; nothing is saved until you do. Shows the cost first.</p>
+            <div class="presets" id="st-brand-presets"></div>
+            <div class="chatlog" id="st-brand-chat"></div>
+            <div class="proposal" id="st-brand-proposal" hidden></div>
+            <textarea id="st-brand-message" placeholder="e.g. Sample price is now a flat 1,500/-; we don't make kidswear"></textarea>
+            <div class="actions"><button class="btn primary" id="st-brand-ask" onclick="askBrandTuner()">Ask</button>
+              <button class="btn ghost" onclick="resetBrandTuner()">New conversation</button></div>
+          </div>
+        </div>
+      </div>
       <h2 style="font-size:16px">FAQ answers</h2>
       <p class="stat">Approved answers can be approved in bulk from Chat with one click. An answer is <b>trusted</b> once you approve it here or approve it unchanged in Chat 3 times; with auto-send on, trusted answers go out on their own after a minute unless you step in. Editing an answer removes its approval and resets its count.</p>
       <div id="faq-list"></div>
@@ -153,10 +250,10 @@
   </div>
 </dialog>
 <dialog id="cost-dialog">
-  <div class="body"><h2 style="margin-top:0">Ask Claude?</h2><p id="cost-text"></p></div>
+  <div class="body"><h2 style="margin-top:0">Ask the model?</h2><p id="cost-text"></p></div>
   <div class="foot">
     <button class="btn" onclick="document.getElementById('cost-dialog').close()">Cancel</button>
-    <button class="btn primary" id="cost-confirm" onclick="confirmStrategist()">Ask Claude</button>
+    <button class="btn primary" id="cost-confirm" onclick="runCostAction()">Ask</button>
   </div>
 </dialog>
 <div id="tooltip" hidden></div>
@@ -165,7 +262,9 @@
 <script src="/static/chat.js"></script>
 <script src="/static/sales.js"></script>
 <script src="/static/marketing.js"></script>
+<script src="/static/prospecting.js"></script>
 <script src="/static/settings.js"></script>
+<script src="/static/brand.js"></script>
 <script>go(location.hash.slice(1) || "chat");</script>
 </body>
 </html>

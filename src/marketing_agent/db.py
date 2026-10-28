@@ -119,6 +119,80 @@ CREATE TABLE IF NOT EXISTS app_settings (
     updated_at      TEXT NOT NULL
 );
 
+-- Seen-ledger of the brand finder (brands/finder.py): every Instagram handle it has looked at.
+CREATE TABLE IF NOT EXISTS brand_candidates (
+    username        TEXT PRIMARY KEY,  -- lower-case Instagram handle
+    status          TEXT NOT NULL,     -- lead / rejected / unavailable / known
+    reason          TEXT,              -- why it was rejected, or where a known brand came from
+    region          TEXT,              -- country, lower-case ISO code: us / in / gb ...
+    name            TEXT,
+    followers       INTEGER,
+    founder         TEXT,
+    website         TEXT,
+    bio             TEXT,
+    last_post       TEXT,
+    signals         TEXT,
+    sources         TEXT,              -- how it was found: search / site / hashtag / snowball / seed
+    delivered_on    TEXT,              -- run date it was delivered as a lead (never repeated)
+    snowballed_at   TEXT,              -- last time its captions were mined for more brands
+    checked_at      TEXT NOT NULL,
+    search_id       INTEGER,           -- the search run that found it
+    query           TEXT,              -- the web search that found it
+    stage           TEXT,              -- prospects (status lead): found / shortlisted / contacted / dismissed
+    stage_at        TEXT
+);
+
+-- Prospecting (Marketing > Prospecting in the app): every search run, the queries it ran, and the
+-- versions of the search setup. Candidates found live in brand_candidates (search_id / query / stage).
+CREATE TABLE IF NOT EXISTS brand_searches (
+    id              INTEGER PRIMARY KEY,
+    config_id       INTEGER REFERENCES brand_search_configs(id),
+    status          TEXT NOT NULL,     -- running / done / failed
+    stats_json      TEXT,
+    leads_usa       INTEGER NOT NULL DEFAULT 0,   -- before countries were configurable; see leads_json
+    leads_india     INTEGER NOT NULL DEFAULT 0,
+    leads_json      TEXT,              -- {"us": 12, "gb": 3, ...}
+    stopped         TEXT,              -- why it ended before the quota was met
+    error           TEXT,
+    started_at      TEXT NOT NULL,
+    finished_at     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS brand_search_queries (
+    id              INTEGER PRIMARY KEY,
+    search_id       INTEGER NOT NULL REFERENCES brand_searches(id),
+    query           TEXT NOT NULL,
+    kind            TEXT NOT NULL,     -- search (Instagram results) / site (brand websites)
+    region          TEXT,
+    results         INTEGER NOT NULL,
+    new_candidates  INTEGER NOT NULL,
+    ran_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS brand_search_queries_by_query ON brand_search_queries (query);
+
+CREATE TABLE IF NOT EXISTS brand_search_configs (
+    id              INTEGER PRIMARY KEY,
+    config_json     TEXT NOT NULL,
+    note            TEXT,              -- what changed
+    created_by      TEXT NOT NULL,     -- user / ai
+    created_at      TEXT NOT NULL
+);
+
+-- Versions of brand.md saved from Settings (the file itself stays the source of truth).
+CREATE TABLE IF NOT EXISTS brand_profile_versions (
+    id              INTEGER PRIMARY KEY,
+    content         TEXT NOT NULL,
+    note            TEXT,
+    created_by      TEXT NOT NULL,     -- user / ai / file (what was on disk before the first edit)
+    created_at      TEXT NOT NULL
+);
+
+-- First use of each hashtag in Meta's rolling 7-day window (max 30 unique hashtags per account).
+CREATE TABLE IF NOT EXISTS hashtag_usage (
+    tag             TEXT PRIMARY KEY,
+    first_used_at   TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS suppression (
     value           TEXT PRIMARY KEY,  -- email address or IG username, lower-cased
     reason          TEXT,
@@ -142,7 +216,8 @@ class Database:
         path = Path(path)
         if str(path) != ":memory:":
             path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(path), check_same_thread=check_same_thread)
+        # A background brand search writes through its own connection; wait for each other's short writes.
+        self.conn = sqlite3.connect(str(path), check_same_thread=check_same_thread, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
@@ -156,6 +231,22 @@ class Database:
         for column, kind in columns.items():
             if column not in have:
                 self.conn.execute(f"ALTER TABLE messages ADD COLUMN {column} {kind}")
+        have = {row["name"] for row in self.conn.execute("PRAGMA table_info(brand_candidates)")}
+        for column in ("search_id", "query", "stage", "stage_at"):
+            if column not in have:
+                kind = "INTEGER" if column == "search_id" else "TEXT"
+                self.conn.execute(f"ALTER TABLE brand_candidates ADD COLUMN {column} {kind}")
+        have = {row["name"] for row in self.conn.execute("PRAGMA table_info(brand_searches)")}
+        if "leads_json" not in have:
+            self.conn.execute("ALTER TABLE brand_searches ADD COLUMN leads_json TEXT")
+        # Regions became ISO country codes.
+        self.conn.execute("UPDATE brand_candidates SET region = CASE region WHEN 'usa' THEN 'us' ELSE 'in' END "
+                          "WHERE region IN ('usa', 'india')")
+        self.conn.execute("""UPDATE brand_searches SET leads_json = json_object('us', leads_usa, 'in', leads_india)
+                             WHERE leads_json IS NULL AND status != 'running'""")
+        # Brands qualified before prospect stages existed start as "found".
+        self.conn.execute("UPDATE brand_candidates SET stage = 'found', stage_at = checked_at "
+                          "WHERE status = 'lead' AND stage IS NULL")
         self.conn.commit()
 
     # ---- leads -----------------------------------------------------------
@@ -452,6 +543,200 @@ class Database:
                                            HAVING MAX(created_time) >= ?)
                ORDER BY m.conversation_id, m.created_time""",
             (since.astimezone(timezone.utc).isoformat(timespec="seconds"),)).fetchall()
+
+    # ---- brand finder ----------------------------------------------------
+
+    def brand_candidate(self, username: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM brand_candidates WHERE username = ?",
+                                 (username.lower(),)).fetchone()
+
+    def save_brand_candidate(self, username: str, status: str, **fields: Any) -> None:
+        """Insert or replace what is known about a handle; keeps delivered_on / snowballed_at / sources."""
+        username = username.lower().lstrip("@")
+        old = self.brand_candidate(username)
+        if old:
+            for keep in ("delivered_on", "snowballed_at", "search_id", "query", "stage", "stage_at"):
+                fields.setdefault(keep, old[keep])
+            sources = set(filter(None, (old["sources"] or "").split(","))) | set(
+                filter(None, (fields.get("sources") or "").split(",")))
+            fields["sources"] = ",".join(sorted(sources))
+        if status == "lead" and not fields.get("stage"):
+            fields["stage"], fields["stage_at"] = "found", now_iso()
+        row = {"username": username, "status": status, "checked_at": now_iso(), **fields}
+        cols = ", ".join(row)
+        marks = ", ".join("?" for _ in row)
+        self.conn.execute(f"INSERT OR REPLACE INTO brand_candidates ({cols}) VALUES ({marks})", tuple(row.values()))
+        self.conn.commit()
+
+    def brand_usernames_checked_since(self, since: datetime) -> set[str]:
+        """Handles not worth another lookup: delivered, known from elsewhere, already a lead, or checked after `since`."""
+        rows = self.conn.execute(
+            """SELECT username FROM brand_candidates
+               WHERE status = 'known' OR delivered_on IS NOT NULL OR (checked_at >= ? AND status != 'queued')
+               UNION SELECT ig_username FROM leads WHERE ig_username IS NOT NULL
+               UNION SELECT value FROM suppression""",
+            (since.astimezone(timezone.utc).isoformat(timespec="seconds"),)).fetchall()
+        return {r[0] for r in rows}
+
+    def queued_brand_candidates(self) -> list[sqlite3.Row]:
+        """Candidates found by an earlier run that ran out of time before checking them."""
+        return self.conn.execute("SELECT * FROM brand_candidates WHERE status = 'queued' ORDER BY checked_at").fetchall()
+
+    def snowball_seeds(self, limit: int, before: datetime) -> list[sqlite3.Row]:
+        """Leads and known brands whose captions haven't been mined since `before`, newest first."""
+        return self.conn.execute(
+            """SELECT * FROM brand_candidates WHERE status IN ('lead', 'known')
+               AND (snowballed_at IS NULL OR snowballed_at < ?) ORDER BY checked_at DESC LIMIT ?""",
+            (before.astimezone(timezone.utc).isoformat(timespec="seconds"), limit)).fetchall()
+
+    def mark_snowballed(self, username: str) -> None:
+        self.conn.execute("UPDATE brand_candidates SET snowballed_at = ? WHERE username = ?",
+                          (now_iso(), username.lower()))
+        self.conn.commit()
+
+    def mark_delivered(self, usernames: Iterable[str], run_date: str) -> None:
+        self.conn.executemany("UPDATE brand_candidates SET delivered_on = ? WHERE username = ?",
+                              [(run_date, u.lower()) for u in usernames])
+        self.conn.commit()
+
+    def brand_leads(self, *, delivered_on: str | None = None, limit: int = 200) -> list[sqlite3.Row]:
+        if delivered_on:
+            return self.conn.execute("SELECT * FROM brand_candidates WHERE delivered_on = ? ORDER BY region, followers",
+                                     (delivered_on,)).fetchall()
+        return self.conn.execute(
+            "SELECT * FROM brand_candidates WHERE delivered_on IS NOT NULL ORDER BY delivered_on DESC, region LIMIT ?",
+            (limit,)).fetchall()
+
+    # ---- prospecting ------------------------------------------------------
+
+    def save_search_config(self, config_json: str, *, note: str, created_by: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO brand_search_configs (config_json, note, created_by, created_at) VALUES (?, ?, ?, ?)",
+            (config_json, note, created_by, now_iso()))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def search_configs(self, limit: int = 20) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM brand_search_configs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def search_config(self, config_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM brand_search_configs WHERE id = ?", (config_id,)).fetchone()
+
+    def start_brand_search(self, config_id: int | None) -> int:
+        cur = self.conn.execute("INSERT INTO brand_searches (config_id, status, started_at) VALUES (?, 'running', ?)",
+                                (config_id, now_iso()))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def finish_brand_search(self, search_id: int, *, status: str, stats: dict | None = None,
+                            leads: dict[str, int] | None = None, stopped: str = "", error: str = "") -> None:
+        leads = leads or {}
+        self.conn.execute(
+            """UPDATE brand_searches SET status = ?, stats_json = ?, leads_json = ?, leads_usa = ?, leads_india = ?,
+               stopped = ?, error = ?, finished_at = ? WHERE id = ?""",
+            (status, json.dumps(stats or {}), json.dumps(leads), leads.get("us", 0), leads.get("in", 0),
+             stopped or None, error or None, now_iso(), search_id))
+        self.conn.commit()
+
+    def fail_unfinished_searches(self) -> None:
+        """Runs left 'running' by a stopped app."""
+        self.conn.execute("UPDATE brand_searches SET status = 'failed', error = 'interrupted', finished_at = ? "
+                          "WHERE status = 'running'", (now_iso(),))
+        self.conn.commit()
+
+    def brand_searches(self, limit: int = 30) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM brand_searches ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def add_search_query(self, search_id: int, query: str, kind: str, region: str, results: int,
+                         new_candidates: int) -> None:
+        self.conn.execute(
+            """INSERT INTO brand_search_queries (search_id, query, kind, region, results, new_candidates, ran_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""", (search_id, query, kind, region or None, results, new_candidates, now_iso()))
+        self.conn.commit()
+
+    def query_yield(self, limit: int = 400) -> list[sqlite3.Row]:
+        """Per query: runs, candidates, qualified prospects and how far they got."""
+        return self.conn.execute(
+            """SELECT q.query, q.kind, MAX(q.region) AS region, COUNT(*) AS runs, SUM(q.results) AS results,
+                      SUM(q.new_candidates) AS candidates,
+                      (SELECT COUNT(*) FROM brand_candidates b WHERE b.query = q.query AND b.status = 'lead') AS leads,
+                      (SELECT COUNT(*) FROM brand_candidates b WHERE b.query = q.query AND b.status = 'rejected') AS rejected,
+                      (SELECT COUNT(*) FROM brand_candidates b WHERE b.query = q.query AND b.stage = 'contacted') AS contacted,
+                      MAX(q.ran_at) AS last_run
+               FROM brand_search_queries q GROUP BY q.query, q.kind ORDER BY leads DESC, candidates DESC LIMIT ?""",
+            (limit,)).fetchall()
+
+    def rejection_reasons(self, limit: int = 15) -> list[sqlite3.Row]:
+        """Why candidates were turned down, most common first (numbers folded so '12034 followers' groups)."""
+        return self.conn.execute(
+            """SELECT CASE WHEN reason LIKE '%followers >=%' THEN 'too many followers'
+                           WHEN reason LIKE 'inactive%' THEN 'inactive (no post in 60 days)'
+                           WHEN reason LIKE '%established' THEN 'too many posts (established)'
+                           WHEN reason LIKE 'model:%' THEN 'not a fit (model)'
+                           ELSE reason END AS why, COUNT(*) AS n
+               FROM brand_candidates WHERE status IN ('rejected', 'unavailable') GROUP BY why ORDER BY n DESC LIMIT ?""",
+            (limit,)).fetchall()
+
+    def prospects(self, *, stage: str | None = None, region: str | None = None, search: str | None = None,
+                  search_id: int | None = None, limit: int = 500) -> list[sqlite3.Row]:
+        """Qualified brands with their prospect stage and, when they've talked to us, their DM conversation."""
+        where, args = ["b.status = 'lead'"], []
+        if stage:
+            where.append("b.stage = ?"); args.append(stage)
+        if region:
+            where.append("b.region = ?"); args.append(region)
+        if search_id:
+            where.append("b.search_id = ?"); args.append(search_id)
+        if search:
+            where.append("(b.username LIKE ? OR b.name LIKE ? OR b.bio LIKE ?)"); args += [f"%{search}%"] * 3
+        return self.conn.execute(
+            f"""SELECT b.*, c.id AS conversation_id FROM brand_candidates b
+                LEFT JOIN ig_conversations c ON lower(c.username) = b.username
+                WHERE {' AND '.join(where)} ORDER BY b.checked_at DESC LIMIT ?""", (*args, limit)).fetchall()
+
+    def set_prospect_stage(self, username: str, stage: str) -> None:
+        cur = self.conn.execute("UPDATE brand_candidates SET stage = ?, stage_at = ? WHERE username = ? AND status = 'lead'",
+                                (stage, now_iso(), username.lower().lstrip("@")))
+        self.conn.commit()
+        if cur.rowcount == 0:
+            raise KeyError(f"unknown prospect {username}")
+
+    def prospect_usernames(self) -> dict[str, str]:
+        """username -> prospect stage, for every qualified brand."""
+        return {r[0]: r[1] for r in self.conn.execute(
+            "SELECT username, stage FROM brand_candidates WHERE status = 'lead'").fetchall()}
+
+    # ---- brand profile versions -------------------------------------------
+
+    def add_brand_version(self, content: str, *, note: str, created_by: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO brand_profile_versions (content, note, created_by, created_at) VALUES (?, ?, ?, ?)",
+            (content, note, created_by, now_iso()))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def brand_versions(self, limit: int = 30) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT id, note, created_by, created_at, length(content) AS chars "
+                                 "FROM brand_profile_versions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def brand_version(self, version_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM brand_profile_versions WHERE id = ?", (version_id,)).fetchone()
+
+    def hashtags_used_since(self, since: datetime) -> set[str]:
+        """Hashtags whose 7-day window is still open (querying them again is free)."""
+        rows = self.conn.execute("SELECT tag FROM hashtag_usage WHERE first_used_at >= ?",
+                                 (since.astimezone(timezone.utc).isoformat(timespec="seconds"),)).fetchall()
+        return {r["tag"] for r in rows}
+
+    def record_hashtag(self, tag: str, window_start: datetime) -> None:
+        """Start a new 7-day window for `tag` unless one is already open."""
+        tag = tag.lower().lstrip("#")
+        self.conn.execute(
+            """INSERT INTO hashtag_usage (tag, first_used_at) VALUES (?, ?)
+               ON CONFLICT (tag) DO UPDATE SET first_used_at = excluded.first_used_at
+               WHERE hashtag_usage.first_used_at < ?""",
+            (tag, now_iso(), window_start.astimezone(timezone.utc).isoformat(timespec="seconds")))
+        self.conn.commit()
 
     # ---- suppression -----------------------------------------------------
 

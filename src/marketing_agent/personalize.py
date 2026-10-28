@@ -10,9 +10,22 @@ from pydantic import BaseModel, Field
 
 from .llm import LLM
 
+# A one-person business: every message is the founder talking. Applies whatever brand.md says.
+FOUNDER_VOICE = """\
+This is a one-person business: the founder runs it and personally writes and reviews every \
+message. Write as the founder would:
+- Simple and humble. Short, plain sentences; no sales language, superlatives or hype \
+("best quality", "leading", "premium", "world-class").
+- Only the truth. Use facts, prices and policies from the brand profile; never invent them. \
+If the answer isn't there, say so plainly ("Let me check and get back to you") instead of guessing.
+- Never imply a team, departments, a factory or a scale the profile doesn't describe.
+- It's fine to say what we can't do, and to offer the nearest thing we can."""
+
 SYSTEM_PROMPT = """\
-You write outreach on behalf of the brand described below. Every message goes to a real \
-person, and a human on the brand's team reviews each draft before it is sent.
+You write messages on behalf of the business described below. Every message goes to a real \
+person, and the founder reviews each draft before it is sent.
+
+{founder_voice}
 
 Write like a thoughtful person, not a marketing template:
 - Open with something specific to this lead (their company, role, bio, or content). Never \
@@ -63,7 +76,7 @@ class Personalizer:
     def __init__(self, brand_file: Path, *, llm: LLM):
         if not brand_file.exists():
             raise FileNotFoundError(f"{brand_file} not found. Run `agent init` and describe your brand there.")
-        self.system = SYSTEM_PROMPT.format(brand=brand_file.read_text().strip())
+        self.system = SYSTEM_PROMPT.format(founder_voice=FOUNDER_VOICE, brand=brand_file.read_text().strip())
         self.llm = llm
 
     def _parse(self, prompt: str, output_format: type[BaseModel]) -> BaseModel:

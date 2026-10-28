@@ -8,7 +8,7 @@ from typing import Callable
 
 from ..context import format_messages
 from ..db import Database
-from .analysis import STAGES, Analysis, Lead, analyze, funnel_report, lost_examples, outreach_report
+from .analysis import FUNNEL, STAGES, Analysis, Lead, analyze, funnel_report, lost_examples, outreach_report
 from .strategist import Strategist
 
 DEFAULT_LOST_AFTER_DAYS = 14
@@ -33,7 +33,13 @@ class InsightsService:
         with self.lock:
             rows = self.db.ig_messages_since(now - timedelta(days=days))
             overrides = self.db.funnel_overrides()
-        return analyze(rows, self.our_id, now=now, lost_after_days=self.lost_after_days(), overrides=overrides)
+            prospects = self.db.prospect_usernames()
+        analysis = analyze(rows, self.our_id, now=now, lost_after_days=self.lost_after_days(), overrides=overrides)
+        # Conversations with brands the brand finder found count as their own lead source.
+        for lead in analysis.leads:
+            if (lead.username or "").lower() in prospects:
+                lead.source = "brand_finder"
+        return analysis
 
     @staticmethod
     def _filter(leads: list[Lead], segment: str | None, source: str | None) -> list[Lead]:
@@ -65,6 +71,40 @@ class InsightsService:
             if not self.db.ig_conversation(conversation_id):
                 raise KeyError(f"unknown conversation {conversation_id}")
             self.db.set_funnel_override(conversation_id, stage)
+
+    # ---- prospecting -> sales ---------------------------------------------------------
+
+    def prospect_conversations(self, *, days: int = 365) -> dict[str, dict]:
+        """Prospect username -> its conversation's funnel stage, for prospects who replied to us."""
+        return {l.username.lower(): {"conversation_id": l.conversation_id, "stage": l.stage, "reached": l.reached}
+                for l in self._analysis(days).leads if l.source == "brand_finder" and l.username}
+
+    def prospect_funnel(self, *, days: int = 365) -> dict:
+        """Found -> Shortlisted -> Contacted -> Replied -> ... -> Won, for brands the brand finder found."""
+        with self.lock:
+            stages = self.db.prospect_usernames()
+            with_chat = {r[0] for r in self.db.conn.execute(
+                "SELECT lower(username) FROM ig_conversations WHERE username IS NOT NULL").fetchall()}
+        convos = self.prospect_conversations(days=days)
+        contacted = {u for u, s in stages.items() if s == "contacted" or u in with_chat}
+        counts = [
+            ("found", "Found", len(stages)),
+            ("shortlisted", "Shortlisted", len({u for u, s in stages.items() if s == "shortlisted"} | contacted)),
+            ("contacted", "Contacted", len(contacted)),
+            ("replied", "Replied", len(convos)),
+        ]
+        for stage in FUNNEL[2:]:                       # qualified, quoted, order, won
+            reached = sum(FUNNEL.index(c["reached"]) >= FUNNEL.index(stage) or c["stage"] == stage
+                          for c in convos.values())
+            counts.append((stage, {"qualified": "Qualified", "quoted": "Quoted", "order": "Sample / Order",
+                                   "won": "Won"}[stage], reached))
+        steps, prev = [], None
+        for key, label, n in counts:
+            steps.append({"stage": key, "label": label, "reached": n,
+                          "conversion": round(100 * n / prev, 1) if prev else None})
+            prev = n
+        return {"steps": steps, "dismissed": sum(s == "dismissed" for s in stages.values()),
+                "lost": sum(c["stage"] == "lost" for c in convos.values())}
 
     def marketing(self, *, days: int = DEFAULT_DAYS) -> dict:
         analysis = self._analysis(days)

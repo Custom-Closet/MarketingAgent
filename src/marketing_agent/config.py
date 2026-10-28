@@ -68,6 +68,15 @@ class Settings:
     ig_page_id: str
     graph_api_version: str
 
+    # Brand finder (brands/): daily list of emerging womenswear brands
+    brave_search_api_key: str   # web search for keyword / city sweeps (or SERPER_API_KEY)
+    serper_api_key: str
+    brand_leads_per_region: int
+    brand_search_queries: int   # web searches per run
+    brand_lookup_limit: int     # Business Discovery lookups per run
+    brand_hashtag_budget: int   # of Meta's 30 unique hashtags / 7 days; 0 = skip (captions carry no @mentions)
+    brand_leads_to_pipeline: bool  # also add delivered brands as leads, so DMs get drafted for review
+
     @property
     def ig_configured(self) -> bool:
         return bool(self.ig_access_token and self.ig_user_id)
@@ -117,4 +126,11 @@ def load_settings() -> Settings:
         ig_user_id=_env("IG_USER_ID"),
         ig_page_id=_env("IG_PAGE_ID"),
         graph_api_version=_env("GRAPH_API_VERSION", "v23.0"),
+        brave_search_api_key=_env("BRAVE_SEARCH_API_KEY"),
+        serper_api_key=_env("SERPER_API_KEY"),
+        brand_leads_per_region=_env_int("BRAND_LEADS_PER_REGION", 20),
+        brand_search_queries=_env_int("BRAND_SEARCH_QUERIES", 100),
+        brand_lookup_limit=_env_int("BRAND_LOOKUP_LIMIT", 300),
+        brand_hashtag_budget=_env_int("BRAND_HASHTAG_BUDGET", 0),
+        brand_leads_to_pipeline=_env("BRAND_LEADS_TO_PIPELINE", "1").lower() in ("1", "true", "yes"),
     )

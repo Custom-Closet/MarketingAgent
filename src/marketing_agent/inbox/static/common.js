@@ -28,14 +28,32 @@ document.addEventListener("mousemove", (e) => {
   tip.style.left = `${x}px`; tip.style.top = `${e.clientY + 14}px`;
 });
 
+// Modules and their sub-pages: go("marketing/prospecting") opens Marketing on its Prospecting tab.
 const loaders = {};
-function go(name) {
-  if (!document.getElementById(name)) name = "chat";
+function go(target) {
+  let [name, sub] = target.split("/");
+  if (!document.getElementById(name)) { name = "chat"; sub = undefined; }
   document.querySelectorAll("section[data-title]").forEach((s) => (s.hidden = s.id !== name));
   document.querySelectorAll(".nav").forEach((n) => n.classList.toggle("active", n.dataset.module === name));
   document.title = `${$(name).dataset.title} · Custom Closet`;
-  history.replaceState(null, "", `#${name}`);
-  loaders[name]?.();
+  history.replaceState(null, "", `#${sub ? `${name}/${sub}` : name}`);
+  loaders[name]?.(sub);
+}
+
+// Every model call shows its estimated cost first; onConfirm runs only after "Ask".
+let costAction = null;
+function askCost(text, onConfirm) {
+  $("cost-text").textContent = text;
+  costAction = onConfirm;
+  $("cost-dialog").showModal();
+}
+function runCostAction() {
+  $("cost-dialog").close();
+  const action = costAction; costAction = null;
+  action?.();
+}
+function costText(what, est) {
+  return `This sends ${what} (~${fmt(est.input_tokens)} tokens) to the model. Estimated cost: ${est.usd === null ? "unknown (billed by AWS)" : "$" + est.usd.toFixed(3)}.`;
 }
 
 // Minimal, safe Markdown for strategist answers: headings, bullets, bold, paragraphs.
