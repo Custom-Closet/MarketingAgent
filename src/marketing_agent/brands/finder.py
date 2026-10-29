@@ -68,6 +68,11 @@ def _found(candidate: Candidate, search_id: int | None) -> dict[str, Any]:
                               "sources": ",".join(sorted(candidate.sources))}.items() if v}
 
 
+def month_start(now: datetime | None = None) -> datetime:
+    now = now or datetime.now(timezone.utc)
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
 def backlog(db: Database, wanted: set[str]) -> list[BrandLead]:
     since = (datetime.now(timezone.utc) - BACKLOG_MAX_AGE).isoformat(timespec="seconds")
     rows = db.conn.execute(
@@ -90,6 +95,7 @@ def find_brands(db: Database, *, ig, search: WebSearch | None = None, llm=None,
     wanted = set(ordered)
     total = leads_per_run or max_per_country * len(ordered)
     places = config.place_index() if config else None
+    criteria = config.criteria if config else None
     run = BrandRun(date.today().isoformat(), ordered, total, max_per_country, {c: [] for c in ordered})
     stats = run.stats
     for lead in backlog(db, wanted):
@@ -102,7 +108,7 @@ def find_brands(db: Database, *, ig, search: WebSearch | None = None, llm=None,
             return set(wanted)
         return {c for c in wanted if len(run.leads[c]) >= max_per_country}
 
-    pool = CandidatePool(db.brand_usernames_checked_since(datetime.now(timezone.utc) - RECHECK_AFTER))
+    pool = CandidatePool(db.brand_usernames_checked_since(datetime.now(timezone.utc) - RECHECK_AFTER), criteria)
     for row in db.queued_brand_candidates():
         for source in filter(None, (row["sources"] or "").split(",")):
             pool.add(row["username"], source, followers=row["followers"], region=row["region"], query=row["query"])
@@ -115,18 +121,29 @@ def find_brands(db: Database, *, ig, search: WebSearch | None = None, llm=None,
             queries = search_queries(wanted, config)
             extra = [q for q in queries if not q[2]]            # hand-written queries run every time
             rotating = queries[len(extra):]
-            todays = extra + rotate(rotating, cursor, max(0, search_queries_limit - len(extra)))
+            limit = search_queries_limit
+            if config and config.monthly_search_budget:
+                used = db.searches_since(month_start())
+                limit = min(limit, max(0, config.monthly_search_budget - used))
+                stats["search_budget_left"] = max(0, config.monthly_search_budget - used)
+                if limit == 0:
+                    log(f"  monthly search budget used up ({used:,} of {config.monthly_search_budget:,}); "
+                        "skipping web search")
+            extra = extra[:limit]
+            todays = extra + rotate(rotating, cursor, max(0, limit - len(extra)))
             search_deadline = time.monotonic() + max(0.0, deadline - time.monotonic()) * SEARCH_SHARE
             record = (lambda q, kind, region, results, new: db.add_search_query(search_id, q, kind, region, results, new)
                       ) if search_id else None
-            stats.update(search_sweep(search, todays, pool, deadline=search_deadline, log=log, on_query=record))
+            stats.update(search_sweep(search, todays, pool, deadline=search_deadline, log=log, on_query=record,
+                                      results_per_query=config.results_per_query if config else 10))
             # Only move past queries that ran, so a failed day (bad key, plan limit) doesn't skip them.
             ran = max(0, stats["queries"] - len(extra))
             db.set_setting("brand_search_cursor", str((cursor + ran) % max(1, len(rotating))))
             log(f"  {stats.get('queries', 0)} queries, {stats.get('sites', 0)} brand sites -> {len(pool)} candidates")
 
-        log("== snowball from known brands")
-        lookups += snowball_sweep(ig, db, pool, limit=SNOWBALL_SEEDS, deadline=deadline, log=log)
+        if config is None or config.snowball:
+            log("== snowball from known brands")
+            lookups += snowball_sweep(ig, db, pool, limit=SNOWBALL_SEEDS, deadline=deadline, log=log)
 
         if hashtag_budget > 0:
             log("== hashtags")
@@ -138,7 +155,7 @@ def find_brands(db: Database, *, ig, search: WebSearch | None = None, llm=None,
         stats["dropped_by_snippet"] = pool.dropped
         log(f"== verifying ({len(pool)} candidates)")
         lookups += _verify(db, ig, llm, pool, run, wanted, full_regions, lookup_limit - lookups, deadline, log,
-                           search_id, places)
+                           search_id, places, criteria)
     except InstagramRateLimited as exc:
         run.stopped = f"Instagram rate limit: {exc}"
         log(f"  stopping: {exc}")
@@ -163,7 +180,7 @@ def find_brands(db: Database, *, ig, search: WebSearch | None = None, llm=None,
 
 def _verify(db: Database, ig, llm, pool: CandidatePool, run: BrandRun, wanted: set[str],
             full_regions: Callable[[], set[str]], budget: int, deadline: float, log: Log,
-            search_id: int | None = None, places: dict[str, str] | None = None) -> int:
+            search_id: int | None = None, places: dict[str, str] | None = None, criteria=None) -> int:
     stats = run.stats
     pending: list[tuple[Screened, Candidate]] = []
     lookups = 0
@@ -209,7 +226,7 @@ def _verify(db: Database, ig, llm, pool: CandidatePool, run: BrandRun, wanted: s
                                     **_found(candidate, search_id))
             stats["unavailable"] = stats.get("unavailable", 0) + 1
             continue
-        screened, reason = hard_filters(profile, places=places)
+        screened, reason = hard_filters(profile, places=places, criteria=criteria)
         if screened is None:
             db.save_brand_candidate(profile.username, "rejected", reason=reason,
                                     followers=profile.followers_count, **_found(candidate, search_id))

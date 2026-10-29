@@ -28,6 +28,24 @@ DEFAULT_US_INDIAN_TERMS = [
 ]
 
 
+SEGMENTS = ("womenswear", "kidswear", "menswear")
+
+
+class Criteria(BaseModel):
+    """Who counts as a prospect. Checked on every profile; the follower / post limits also drop big
+    accounts straight from search snippets, before any Instagram lookup."""
+    min_followers: int = Field(0, ge=0, description="Fewer followers than this is too early")
+    max_followers: int = Field(10_000, ge=100, description="This many followers or more is too big")
+    ideal_followers: int = Field(5_000, ge=0, description="Under this ranks first ('ideal')")
+    min_posts: int = Field(3, ge=0)
+    max_posts: int = Field(800, ge=1, description="More posts than this reads as an established brand")
+    active_within_days: int = Field(60, ge=7, le=365, description="Must have posted within this many days")
+    segments: list[str] = Field(default_factory=lambda: ["womenswear"],
+                                description="Who the brand dresses: womenswear / kidswear / menswear")
+    allow_ethnic_only: bool = Field(False, description="Also accept brands selling only traditional ethnicwear")
+    fit_notes: str = Field("", description="Extra rules for the model's fit check, in plain words")
+
+
 class Target(BaseModel):
     country: str = Field(description="ISO 3166 alpha-2 code, lower case, e.g. 'us', 'in', 'gb'")
     places: list[str] = Field(default_factory=list,
@@ -50,11 +68,18 @@ class SearchConfig(BaseModel):
                                      description="Complete queries run as written, e.g. 'site:instagram.com ...'")
     exclude_terms: list[str] = Field(default_factory=list,
                                      description="Words added as -word to every query, e.g. 'swimwear'")
+    criteria: Criteria = Field(default_factory=Criteria)
     leads_per_run: int = Field(40, ge=1, le=500, description="Prospects to find per run, all countries together")
     max_per_country: int = Field(20, ge=1, le=500, description="At most this many from one country per run")
     queries_per_run: int = Field(100, ge=1, le=500)
     lookup_limit: int = Field(300, ge=10, le=1000, description="Instagram profile checks per run")
     minutes: int = Field(12, ge=2, le=60, description="Time budget for one run")
+    # ---- web search cost ----
+    results_per_query: int = Field(10, ge=1, le=100, description="Results asked for per search (Serper free: 10)")
+    site_queries: bool = Field(True, description="Also search brand websites (one extra search per place)")
+    snowball: bool = Field(True, description="Mine known brands' captions for more brands (Instagram calls, no search cost)")
+    monthly_search_budget: int = Field(0, ge=0, description="Stop searching after this many searches a month; 0 = no limit")
+    cost_per_1000: float = Field(1.0, ge=0, description="What the search provider charges per 1,000 searches, in USD")
 
     @model_validator(mode="before")
     @classmethod
@@ -105,4 +130,10 @@ class SearchConfig(BaseModel):
                 merged[code] = dedupe(merged.get(code, []) + t["places"])
         data["targets"] = [{"country": c, "places": p} for c, p in merged.items()]
         data["max_per_country"] = min(data["max_per_country"], data["leads_per_run"])
+        c = data["criteria"]
+        c["segments"] = [s for s in dedupe([s.lower() for s in c["segments"]]) if s in SEGMENTS] or ["womenswear"]
+        c["max_followers"] = max(c["max_followers"], c["min_followers"] + 1)
+        c["ideal_followers"] = min(c["ideal_followers"], c["max_followers"])
+        c["max_posts"] = max(c["max_posts"], c["min_posts"])
+        c["fit_notes"] = c["fit_notes"].strip()[:1000]
         return SearchConfig(**data)

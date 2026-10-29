@@ -45,6 +45,12 @@ each one is searched less often, so prefer a focused list over every state.
 - Keep lists focused: queries that keep finding only big or inactive accounts should go; phrases \
 small labels actually use in bios ("small batch", "made to order", "DM to order") work better than \
 generic fashion words.
+- `criteria` decides who qualifies (follower and post limits, how recently they posted, segments, \
+ethnicwear, extra fit notes). Don't loosen or tighten it unless the person asks; if the data suggests \
+it, say so and let them decide.
+- Cost: every search is billed (`cost_per_1000`). `queries_per_run`, `results_per_query`, \
+`site_queries` and `monthly_search_budget` drive the cost. Don't raise them unless asked; when \
+cutting waste, drop queries that keep finding nothing.
 - Never claim results you weren't given.
 """
 

@@ -23,9 +23,9 @@ from ..db import Database
 from ..sources.instagram import InstagramError, InstagramRateLimited, extract_mentions
 from ..sources.web_search import (SearchError, WebSearch, handle_from_instagram_url, handles_in_text,
                                   instagram_handles_in_html, snippet_stats)
-from .config import SearchConfig
+from .config import Criteria, SearchConfig
 from .geo import country_name
-from .criteria import FOLLOWER_CAP, MAX_MEDIA_COUNT
+from .criteria import FOLLOWER_CAP
 
 Log = Callable[[str], None]
 
@@ -54,10 +54,9 @@ class Candidate:
     region_hint: str | None = None
     query: str | None = None       # the web search that first found it
 
-    @property
-    def priority(self) -> int:
+    def priority(self, max_followers: int = FOLLOWER_CAP) -> int:
         """Lower is looked up first: snippet says small > known neighbours > plain search > hashtag mentions."""
-        if self.followers_hint is not None and self.followers_hint < FOLLOWER_CAP:
+        if self.followers_hint is not None and self.followers_hint < max_followers:
             return 0
         if self.sources & {"snowball", "site", "seed"}:
             return 1
@@ -65,10 +64,11 @@ class Candidate:
 
 
 class CandidatePool:
-    def __init__(self, skip: set[str]):
+    def __init__(self, skip: set[str], criteria: Criteria | None = None):
         self.skip = set(skip)
         self.items: dict[str, Candidate] = {}
         self.dropped = 0
+        self.criteria = criteria or Criteria()
 
     def add(self, username: str, source: str, *, followers: int | None = None, posts: int | None = None,
             region: str | None = None, query: str | None = None) -> bool:
@@ -76,17 +76,19 @@ class CandidatePool:
         username = username.lower().lstrip("@").rstrip(".")
         if not username or username in self.skip:
             return False
-        if (followers is not None and followers >= FOLLOWER_CAP * STALE_HINT_MARGIN) or (
-                posts is not None and posts > MAX_MEDIA_COUNT * STALE_HINT_MARGIN):
+        c = self.criteria
+        # Search snippets can be months old, so only clearly-too-big accounts are dropped here.
+        if (followers is not None and followers >= c.max_followers * STALE_HINT_MARGIN) or (
+                posts is not None and posts > c.max_posts * STALE_HINT_MARGIN):
             self.dropped += 1
             return False
         is_new = username not in self.items
-        c = self.items.setdefault(username, Candidate(username))
-        c.sources.add(source)
+        cand = self.items.setdefault(username, Candidate(username))
+        cand.sources.add(source)
         if followers is not None:
-            c.followers_hint = followers
-        c.region_hint = c.region_hint or region
-        c.query = c.query or query
+            cand.followers_hint = followers
+        cand.region_hint = cand.region_hint or region
+        cand.query = cand.query or query
         return is_new
 
     def take(self, full_regions: set[str]) -> Candidate | None:
@@ -94,7 +96,8 @@ class CandidatePool:
         options = [c for c in self.items.values() if c.region_hint not in full_regions or c.region_hint is None]
         if not options:
             return None
-        best = min(options, key=lambda c: (c.priority, c.followers_hint or FOLLOWER_CAP))
+        cap = self.criteria.max_followers
+        best = min(options, key=lambda c: (c.priority(cap), c.followers_hint or cap))
         del self.items[best.username]
         self.skip.add(best.username)
         return best
@@ -122,9 +125,10 @@ def search_queries(countries: set[str], config: SearchConfig | None = None) -> l
             if target.country != "in":      # Indian founders / craft are the preferred fit outside India
                 qs += [(f'site:instagram.com "{term}" womenswear "{place}"{exclude}', "search", target.country)
                        for term in config.craft_terms]
-            kw = keywords[i % len(keywords)]
-            qs.append((f'"{kw}" "{place}" shop -site:instagram.com -site:pinterest.com{exclude}', "site",
-                       target.country))
+            if config.site_queries:
+                kw = keywords[i % len(keywords)]
+                qs.append((f'"{kw}" "{place}" shop -site:instagram.com -site:pinterest.com{exclude}', "site",
+                           target.country))
         # Spread places through the list so a short slice isn't all one place.
         per_country[target.country] = qs[::3] + qs[1::3] + qs[2::3]
     mixed = [q for group in zip_longest(*per_country.values()) for q in group if q]
@@ -140,7 +144,8 @@ def rotate(items: list, start: int, count: int) -> list:
 
 def search_sweep(search: WebSearch, queries: list[tuple[str, str, str]], pool: CandidatePool, *,
                  deadline: float, log: Log, http: httpx.Client | None = None,
-                 on_query: Callable[[str, str, str, int, int], None] | None = None) -> dict[str, int]:
+                 on_query: Callable[[str, str, str, int, int], None] | None = None,
+                 results_per_query: int = 10) -> dict[str, int]:
     """`on_query(query, kind, region, results, new_candidates)` is called after every search."""
     stats = {"queries": 0, "search_errors": 0, "sites": 0}
     site_urls: dict[str, tuple[str | None, str]] = {}
@@ -150,7 +155,7 @@ def search_sweep(search: WebSearch, queries: list[tuple[str, str, str]], pool: C
             log("  search: out of time")
             break
         try:
-            results = search.search(query)
+            results = search.search(query, count=results_per_query)
         except SearchError as exc:
             stats["search_errors"] += 1
             log(f"  search failed: {exc}")

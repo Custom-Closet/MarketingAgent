@@ -15,34 +15,37 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from ..sources.instagram import IGProfile, parse_time
+from .config import Criteria
 from .geo import infer_country
 
-FOLLOWER_CAP = 10_000       # hard cap (exclusive)
-IDEAL_CAP = 5_000           # "ideal" below this
-MIN_MEDIA_COUNT = 3
-MAX_MEDIA_COUNT = 800       # more posts than this reads as an established brand
-ACTIVITY_WINDOW_DAYS = 60
+# Followers, posts, activity and segments are set per search setup (config.Criteria); these are the defaults.
+DEFAULT_CRITERIA = Criteria()
+FOLLOWER_CAP = DEFAULT_CRITERIA.max_followers
+IDEAL_CAP = DEFAULT_CRITERIA.ideal_followers
+MAX_MEDIA_COUNT = DEFAULT_CRITERIA.max_posts
 RECENT_MEDIA_LIMIT = 5
 
 APPAREL_KEYWORDS = [
     "clothing", "apparel", "womenswear", "women's wear", "womens wear", "fashion", "label", "dresses",
     "co-ords", "coords", "co-ord", "tops", "wear", "garments", "collection", "designer", "studio",
     "atelier", "couture", "ready to wear", "rtw", "prêt", "pret", "linen", "sets", "separates",
+    "kidswear", "kids wear", "menswear", "men's wear", "clothes", "outfits",
 ]
 # Never a fit: resellers / curated / non-production businesses.
 EXCLUDE_KEYWORDS = [
     "reseller", "resellers", "curated boutique", "multi-designer", "multi designer", "multidesigner",
     "dropship", "dropshipping", "preloved", "thrift", "consignment", "wholesale only", "rental",
 ]
-# Not a fit unless the bio also shows contemporary womenswear (bridal-only / kids-only / menswear-only).
-EXCLUDE_UNLESS_WOMENSWEAR = [
-    "bridal", "bridalwear", "wedding wear", "kidswear", "kids wear", "kids", "baby",
-    "menswear", "men's wear", "for men",
-]
-WOMENSWEAR_KEYWORDS = [
-    "women", "womens", "women's", "womenswear", "her", "she", "dresses", "co-ords", "western",
-    "contemporary", "everyday wear", "workwear", "resort", "tops",
-]
+# Who a brand dresses. A bio naming only segments the search doesn't want is not a fit.
+SEGMENT_KEYWORDS = {
+    "womenswear": ["women", "womens", "women's", "womenswear", "her", "she", "dresses", "co-ords", "ladies",
+                   "everyday wear", "workwear", "resort", "tops"],
+    "kidswear": ["kids", "kidswear", "kids wear", "children", "childrens", "children's", "baby", "babies",
+                 "toddler", "toddlers", "little ones", "infant", "girls", "boys"],
+    "menswear": ["men", "mens", "men's", "menswear", "men's wear", "for men", "gents"],
+}
+# Bridal-only labels: not a fit unless the bio also shows a wanted segment.
+BRIDAL_KEYWORDS = ["bridal", "bridalwear", "wedding wear"]
 # Traditional ethnicwear: not a fit unless the bio also shows western / contemporary pieces.
 ETHNIC_KEYWORDS = [
     "kurta", "kurtas", "kurti", "kurtis", "saree", "sarees", "sari", "lehenga", "lehengas", "salwar",
@@ -74,7 +77,8 @@ def _phrase_re(phrases: list[str]) -> re.Pattern:
 
 
 APPAREL_RE, EXCLUDE_RE = _phrase_re(APPAREL_KEYWORDS), _phrase_re(EXCLUDE_KEYWORDS)
-EXCLUDE_SOFT_RE, WOMENSWEAR_RE = _phrase_re(EXCLUDE_UNLESS_WOMENSWEAR), _phrase_re(WOMENSWEAR_KEYWORDS)
+SEGMENT_RES = {seg: _phrase_re(words) for seg, words in SEGMENT_KEYWORDS.items()}
+BRIDAL_RE = _phrase_re(BRIDAL_KEYWORDS)
 ETHNIC_RE, WESTERN_RE = _phrase_re(ETHNIC_KEYWORDS), _phrase_re(WESTERN_KEYWORDS)
 FIT_RE, INDIAN_CONN_RE = _phrase_re(FIT_KEYWORDS), _phrase_re(INDIAN_CONNECTION_KEYWORDS)
 
@@ -125,10 +129,11 @@ class BrandLead:
     media_count: int = 0
     signals: list[str] = field(default_factory=list)
     sources: set[str] = field(default_factory=set)
+    ideal_followers: int = IDEAL_CAP
 
     @property
     def tier(self) -> str:
-        return "ideal" if self.followers < IDEAL_CAP else "ok"
+        return "ideal" if self.followers < self.ideal_followers else "ok"
 
     @property
     def link(self) -> str:
@@ -151,6 +156,7 @@ class Screened:
     founder: str
     lead: BrandLead | None = None
     reason: str = ""      # keyword verdict when rejected
+    criteria: Criteria = field(default_factory=Criteria)
 
     def to_lead(self, region: str, *, founder: str = "") -> BrandLead:
         p = self.profile
@@ -160,23 +166,26 @@ class Screened:
             signals += sorted({f"indian:{m.lower()}" for m in INDIAN_CONN_RE.findall(text)})
         return BrandLead(region, p.username.lower(), normalize(p.name) or p.username, p.followers_count or 0,
                          self.founder or founder, p.website or "", normalize(p.biography), self.last_post,
-                         p.media_count or 0, signals)
+                         p.media_count or 0, signals, ideal_followers=self.criteria.ideal_followers)
 
 
-def hard_filters(profile: IGProfile, *, now: datetime | None = None,
-                 places: dict[str, str] | None = None) -> tuple[Screened | None, str]:
+def hard_filters(profile: IGProfile, *, now: datetime | None = None, places: dict[str, str] | None = None,
+                 criteria: Criteria | None = None) -> tuple[Screened | None, str]:
     """Numbers and exclusions that never need judgement. Returns (screened, "") or (None, reason)."""
+    c = criteria or DEFAULT_CRITERIA
     now = now or datetime.now(timezone.utc)
     name, bio = normalize(profile.name), normalize(profile.biography)
     text = f"{name} {bio}"
     followers, media_count = profile.followers_count, profile.media_count or 0
     if followers is None:
         return None, "followers_count hidden"
-    if followers >= FOLLOWER_CAP:
-        return None, f"{followers} followers >= {FOLLOWER_CAP}"
-    if media_count < MIN_MEDIA_COUNT:
+    if followers >= c.max_followers:
+        return None, f"{followers} followers >= {c.max_followers}"
+    if followers < c.min_followers:
+        return None, f"only {followers} followers (< {c.min_followers})"
+    if media_count < c.min_posts:
         return None, f"only {media_count} posts"
-    if media_count > MAX_MEDIA_COUNT:
+    if media_count > c.max_posts:
         return None, f"{media_count} posts - established"
     if m := EXCLUDE_RE.search(text):
         return None, f"excluded keyword '{m.group(0)}'"
@@ -184,20 +193,24 @@ def hard_filters(profile: IGProfile, *, now: datetime | None = None,
     if not stamps:
         return None, "no posts returned"
     last_post = max(stamps)
-    if now - last_post > timedelta(days=ACTIVITY_WINDOW_DAYS):
+    if now - last_post > timedelta(days=c.active_within_days):
         return None, f"inactive (last post {last_post.date()})"
     captions = normalize(" ".join(m.get("caption") or "" for m in profile.recent_media))
     return Screened(profile, last_post, captions, infer_region(name, bio, profile.website or "", captions, places),
-                    sorted({m.lower() for m in FIT_RE.findall(text)}), extract_founder(bio, name)), ""
+                    sorted({m.lower() for m in FIT_RE.findall(text)}), extract_founder(bio, name), criteria=c), ""
 
 
 def keyword_verdict(screened: Screened, wanted: set[str]) -> Screened:
     """Accept or reject on keywords alone (used when no model is configured)."""
-    p = screened.profile
+    p, c = screened.profile, screened.criteria
     text = normalize(f"{p.name} {p.biography}")
-    if (m := EXCLUDE_SOFT_RE.search(text)) and not WOMENSWEAR_RE.search(text):
-        screened.reason = f"'{m.group(0)}' without womenswear signal"
-    elif (m := ETHNIC_RE.search(text)) and not WESTERN_RE.search(text):
+    wanted_segment = any(SEGMENT_RES[s].search(text) for s in c.segments)
+    other = next((m for s, rx in SEGMENT_RES.items() if s not in c.segments and (m := rx.search(text))), None)
+    if other and not wanted_segment:
+        screened.reason = f"'{other.group(0)}' - not {' / '.join(c.segments)}"
+    elif (m := BRIDAL_RE.search(text)) and not wanted_segment:
+        screened.reason = f"'{m.group(0)}' only"
+    elif not c.allow_ethnic_only and (m := ETHNIC_RE.search(text)) and not WESTERN_RE.search(text):
         screened.reason = f"traditional ethnicwear ('{m.group(0)}')"
     elif not APPAREL_RE.search(text):
         screened.reason = "bio does not look like a clothing brand"

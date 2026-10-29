@@ -115,6 +115,24 @@ class ProspectingService:
             if db is not self.db:
                 db.conn.close()
 
+    def usage(self) -> dict:
+        """Web searches used (what the search API bills for) and what they cost at the setup's rate."""
+        from datetime import datetime, timedelta, timezone
+
+        from ..brands.finder import month_start
+        config, _ = self.config()
+        now = datetime.now(timezone.utc)
+        with self.lock:
+            month = self.db.searches_since(month_start(now))
+            today = self.db.searches_since(now.replace(hour=0, minute=0, second=0, microsecond=0))
+            last_30 = self.db.searches_since(now - timedelta(days=30))
+        rate = config.cost_per_1000 / 1000
+        budget = config.monthly_search_budget
+        return {"month": month, "today": today, "last_30_days": last_30, "cost_per_1000": config.cost_per_1000,
+                "month_cost": round(month * rate, 2), "per_run": config.queries_per_run,
+                "per_run_cost": round(config.queries_per_run * rate, 2),
+                "budget": budget, "budget_left": max(0, budget - month) if budget else None}
+
     def searches(self) -> list[dict]:
         with self.lock:
             rows = self.db.brand_searches()

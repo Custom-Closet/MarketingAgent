@@ -203,3 +203,70 @@ def test_total_quota_and_cap_per_country(db):
     assert sum(len(v) for v in run.leads.values()) == 5
     assert max(len(v) for v in run.leads.values()) == 3
     assert {"us", "gb"} == {c for c, v in run.leads.items() if v}
+
+
+# ---- who qualifies and what searching costs ------------------------------------------------
+
+from marketing_agent.brands import criteria as crit, judge
+from marketing_agent.brands.config import Criteria
+
+
+def test_criteria_change_who_qualifies():
+    small = Criteria(max_followers=3_000, ideal_followers=1_000, min_posts=10, active_within_days=14)
+    assert "followers >= 3000" in crit.hard_filters(profile("a", followers=4_000), criteria=small)[1]
+    assert "only 5 posts" in crit.hard_filters(profile("a", media_count=5), criteria=small)[1]
+    assert "inactive" in crit.hard_filters(profile("a", days_ago=20), criteria=small)[1]
+    assert "only 50 followers" in crit.hard_filters(profile("a", followers=50), criteria=Criteria(min_followers=100))[1]
+    s, _ = crit.hard_filters(profile("a", followers=2_000), criteria=small)
+    assert crit.keyword_verdict(s, {"us"}).lead.tier == "ok"                 # ideal is now under 1,000
+
+    kids = "Handmade kidswear for little ones. Brooklyn"
+    s, _ = crit.hard_filters(profile("k", bio=kids))
+    assert "not womenswear" in crit.keyword_verdict(s, {"us"}).reason
+    s, _ = crit.hard_filters(profile("k", bio=kids), criteria=Criteria(segments=["womenswear", "kidswear"]))
+    assert crit.keyword_verdict(s, {"us"}).lead
+    s, _ = crit.hard_filters(profile("m", bio="Menswear label, small batch. Brooklyn"))
+    assert crit.keyword_verdict(s, {"us"}).lead is None
+
+    ethnic = "Handcrafted kurta sets and sarees. Mumbai"
+    s, _ = crit.hard_filters(profile("e", bio=ethnic), criteria=Criteria(allow_ethnic_only=True))
+    assert crit.keyword_verdict(s, {"in"}).lead
+
+
+def test_fit_check_prompt_follows_the_criteria():
+    default = judge.system_prompt(Criteria())
+    assert "OWN womenswear" in default and "kidswear-only" in default and "traditional ethnicwear only" in default
+    custom = judge.system_prompt(Criteria(segments=["kidswear"], allow_ethnic_only=True, fit_notes="No swimwear."))
+    assert "OWN kidswear" in custom and "womenswear-only" in custom and "traditional ethnicwear only" not in custom
+    assert custom.rstrip().endswith('never guess from names or language.') and "No swimwear." in custom
+
+
+def test_search_cost_settings(db):
+    config = SearchConfig(keywords=["label"], targets=[{"country": "us", "places": ["Austin", "Dallas"]}],
+                          craft_terms=[], site_queries=False, results_per_query=7, monthly_search_budget=3)
+    assert all(kind == "search" for _, kind, _ in sweeps.search_queries({"us"}, config))
+
+    class CountingSearch(FakeSearch):
+        def search(self, query, *, count=20):
+            self.counts = getattr(self, "counts", []) + [count]
+            return super().search(query, count=count)
+
+    search = CountingSearch({})
+    for _ in range(2):        # 2 searches each run; the 3rd search uses up the budget
+        sid = db.start_brand_search(None)
+        finder.find_brands(db, ig=FakeIG({}), search=search, config=config, deadline=time.monotonic() + 30,
+                           log=lambda _: None, search_id=sid)
+    assert search.counts == [7, 7, 7] and db.searches_since(finder.month_start()) == 3
+    run = finder.find_brands(db, ig=FakeIG({}), search=search, config=config, deadline=time.monotonic() + 30,
+                             log=lambda _: None, search_id=db.start_brand_search(None))
+    assert len(search.counts) == 3 and run.stats["search_budget_left"] == 0
+
+
+def test_usage_reports_searches_and_cost(prospecting):
+    service, _ = prospecting
+    service.start_search()
+    wait_for(service)
+    service.save_config(service.config()[0].model_copy(update={"cost_per_1000": 5.0, "monthly_search_budget": 100}))
+    u = service.usage()
+    assert u["month"] == u["today"] > 0 and u["month_cost"] == round(u["month"] * 0.005, 2)
+    assert u["budget_left"] == 100 - u["month"]

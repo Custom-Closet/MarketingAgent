@@ -275,6 +275,10 @@ def create_app(service: InboxService, insights: InsightsService | None = None,
     def search_status():
         return prospecting.status()
 
+    @app.get("/api/prospecting/usage")
+    def search_usage():
+        return prospecting.usage()
+
     @app.get("/api/prospecting/searches")
     def searches():
         return prospecting.searches()

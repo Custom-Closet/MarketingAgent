@@ -135,9 +135,9 @@ def test_judge_uses_code_region_first_and_model_otherwise():
     b, _ = criteria.hard_filters(profile("b", bio="Saree drapes. Mumbai"))
     c, _ = criteria.hard_filters(profile("c", bio="Everyday dresses. Brooklyn"))
     llm = FakeLLM([
-        {"username": "a", "contemporary_womenswear": True, "country": "in", "founder": "Asha Rao", "reason": "own label"},
-        {"username": "b", "contemporary_womenswear": False, "country": "in", "founder": "", "reason": "ethnicwear"},
-        {"username": "c", "contemporary_womenswear": True, "country": "in", "founder": "", "reason": "own label"},
+        {"username": "a", "fits": True, "country": "in", "founder": "Asha Rao", "reason": "own label"},
+        {"username": "b", "fits": False, "country": "in", "founder": "", "reason": "ethnicwear"},
+        {"username": "c", "fits": True, "country": "in", "founder": "", "reason": "own label"},
     ])
     judge.judge(llm, [a, b, c], {"us", "in"})
     assert (a.lead.region, a.lead.founder) == ("in", "Asha Rao")
@@ -216,7 +216,7 @@ def test_find_brands_end_to_end(db):
 def test_extra_leads_wait_in_backlog(db):
     profiles = {f"label{i}": profile(f"label{i}") for i in range(3)}
     search = FakeSearch({'"Brooklyn"': [ig_result(h) for h in profiles]})
-    llm = FakeLLM([{"username": h, "contemporary_womenswear": True, "country": "us", "founder": "", "reason": "ok"}
+    llm = FakeLLM([{"username": h, "fits": True, "country": "us", "founder": "", "reason": "ok"}
                    for h in profiles])
     first = finder.find_brands(db, ig=FakeIG(profiles), search=search, llm=llm, countries=("us",), max_per_country=2,
                                search_queries_limit=500, deadline=time.monotonic() + 60, log=lambda _: None)

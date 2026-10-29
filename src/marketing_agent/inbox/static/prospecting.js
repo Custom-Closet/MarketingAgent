@@ -2,7 +2,11 @@
 const PROSPECT_STAGES = { found: "Found", shortlisted: "Shortlisted", contacted: "Contacted", dismissed: "Dismissed" };
 const SETUP_LISTS = { keywords: "p-keywords", extra_queries: "p-extra", craft_terms: "p-terms", exclude_terms: "p-exclude" };
 const SETUP_NUMBERS = { leads_per_run: "p-per-run", max_per_country: "p-per-country", queries_per_run: "p-queries",
-                        lookup_limit: "p-lookups", minutes: "p-minutes" };
+                        lookup_limit: "p-lookups", minutes: "p-minutes", results_per_query: "p-results",
+                        monthly_search_budget: "p-budget", cost_per_1000: "p-cost" };
+const SETUP_FLAGS = { site_queries: "p-sites", snowball: "p-snowball" };
+const CRITERIA_NUMBERS = { min_followers: "p-min-followers", max_followers: "p-max-followers", ideal_followers: "p-ideal-followers",
+                           min_posts: "p-min-posts", max_posts: "p-max-posts", active_within_days: "p-active-days" };
 const TUNER_PRESETS = [
   "Which queries are wasting searches, and what should replace them?",
   "Find more Indian / South Asian-owned labels in the USA.",
@@ -36,8 +40,10 @@ async function loadProspecting() {
 }
 
 async function loadProspectTiles() {
-  const f = await api("/api/prospects/funnel").catch(() => null);
+  const [f, u] = await Promise.all([api("/api/prospects/funnel").catch(() => null), api("/api/prospecting/usage").catch(() => null)]);
   if (!f) return;
+  prospecting.usage = u;
+  if (prospecting.setupLoaded) previewSize();
   const n = (k) => f.steps.find((s) => s.stage === k)?.reached ?? 0;
   $("p-tiles").innerHTML = [
     tile("Prospects found", fmt(n("found")), `${fmt(f.dismissed)} dismissed`),
@@ -45,6 +51,7 @@ async function loadProspectTiles() {
     tile("Contacted", fmt(n("contacted")), "DM sent"),
     tile("Replied", fmt(n("replied")), n("contacted") ? `${(100 * n("replied") / n("contacted")).toFixed(0)}% of contacted` : ""),
     tile("Quoted", fmt(n("quoted")), `${fmt(n("won"))} won`),
+    u ? tile("Searches this month", fmt(u.month), `≈ $${u.month_cost.toFixed(2)}${u.budget ? ` · ${fmt(u.budget_left)} left` : ""}`) : "",
   ].join("");
 }
 
@@ -163,6 +170,12 @@ const lines = (text) => text.split("\n").map((l) => l.trim()).filter(Boolean);
 function fillSetup(config) {
   for (const [key, id] of Object.entries(SETUP_LISTS)) $(id).value = config[key].join("\n");
   for (const [key, id] of Object.entries(SETUP_NUMBERS)) $(id).value = config[key];
+  for (const [key, id] of Object.entries(SETUP_FLAGS)) $(id).checked = config[key];
+  const c = config.criteria;
+  for (const [key, id] of Object.entries(CRITERIA_NUMBERS)) $(id).value = c[key];
+  document.querySelectorAll(".p-segment").forEach((box) => (box.checked = c.segments.includes(box.value)));
+  $("p-ethnic").checked = c.allow_ethnic_only;
+  $("p-fit-notes").value = c.fit_notes;
   prospecting.targets = config.targets.map((t) => ({ country: t.country, places: [...t.places] }));
   renderTargets();
 }
@@ -210,13 +223,21 @@ function readSetup() {
   const config = { targets: prospecting.targets.map((t) => ({ country: t.country, places: [...t.places] })) };
   for (const [key, id] of Object.entries(SETUP_LISTS)) config[key] = lines($(id).value);
   for (const [key, id] of Object.entries(SETUP_NUMBERS)) config[key] = Number($(id).value);
+  for (const [key, id] of Object.entries(SETUP_FLAGS)) config[key] = $(id).checked;
+  config.criteria = { segments: [...document.querySelectorAll(".p-segment:checked")].map((b) => b.value),
+                      allow_ethnic_only: $("p-ethnic").checked, fit_notes: $("p-fit-notes").value };
+  for (const [key, id] of Object.entries(CRITERIA_NUMBERS)) config.criteria[key] = Number($(id).value);
   return config;
 }
 
 function previewSize() {
   const c = readSetup();
   const total = c.targets.reduce((sum, t) => sum + Math.max(1, t.places.length)
-    * (c.keywords.length + 1 + (t.country === "in" ? 0 : c.craft_terms.length)), 0);
+    * (c.keywords.length + (c.site_queries ? 1 : 0) + (t.country === "in" ? 0 : c.craft_terms.length)), 0);
+  const perRun = Math.min(c.queries_per_run, total), rate = c.cost_per_1000 / 1000;
+  const u = prospecting.usage;
+  $("p-cost-line").textContent = `Each search is billed by the search API. This setup uses up to ${fmt(perRun)} searches a run, about $${(perRun * rate).toFixed(2)}`
+    + (u ? `. This month so far: ${fmt(u.month)} searches, about $${(u.month * rate).toFixed(2)}${u.budget ? `, ${fmt(u.budget_left)} of ${fmt(u.budget)} left` : ""}.` : ".");
   prospecting.targets.forEach((t, i) => { const el = $(`p-target-count-${i}`); if (el) el.textContent = t.places.length ? `${t.places.length} places` : "country name only"; });
   $("p-size").textContent = `${fmt(total)} searches in rotation (${fmt(c.queries_per_run)} per run, so a full cycle takes ${fmt(Math.max(1, Math.ceil(total / Math.max(1, c.queries_per_run))))} runs).`;
 }

@@ -654,6 +654,11 @@ class Database:
                VALUES (?, ?, ?, ?, ?, ?, ?)""", (search_id, query, kind, region or None, results, new_candidates, now_iso()))
         self.conn.commit()
 
+    def searches_since(self, since: datetime) -> int:
+        """Web searches the brand finder ran since `since` (what the search API bills for)."""
+        return self.conn.execute("SELECT COUNT(*) FROM brand_search_queries WHERE ran_at >= ?",
+                                 (since.astimezone(timezone.utc).isoformat(timespec="seconds"),)).fetchone()[0]
+
     def query_yield(self, limit: int = 400) -> list[sqlite3.Row]:
         """Per query: runs, candidates, qualified prospects and how far they got."""
         return self.conn.execute(

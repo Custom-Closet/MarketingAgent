@@ -163,3 +163,6 @@ table.data td a { color: inherit; }
 /* ---- brand profile editor ---- */
 textarea.code { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; min-height: 420px; }
 .brand-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); margin-bottom: 0; }
+.setup-head { font-size: 14px; margin: 16px 0 2px; padding-top: 12px; border-top: 1px solid var(--grid); }
+.setup-note { font-size: 13px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
+label.check { min-width: 0 !important; display: inline-flex; gap: 6px; align-items: center; margin-right: 10px; }

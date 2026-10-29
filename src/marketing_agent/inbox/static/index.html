@@ -157,6 +157,29 @@
             <div class="form-row"><label for="p-queries">Searches per run</label><input type="number" id="p-queries" min="1" max="500" style="width:80px"></div>
             <div class="form-row"><label for="p-lookups">Instagram profile checks per run</label><input type="number" id="p-lookups" min="10" max="1000" style="width:80px"></div>
             <div class="form-row"><label for="p-minutes">Time limit (minutes)</label><input type="number" id="p-minutes" min="2" max="60" style="width:80px"></div>
+            <h3 class="setup-head">Who qualifies</h3>
+            <p class="sub">Checked on every profile. Search engines can't filter by followers, so the follower and post limits are applied to search snippets (big accounts are dropped before any Instagram check) and again on the real profile.</p>
+            <div class="form-row"><label for="p-min-followers">Followers between</label>
+              <input type="number" id="p-min-followers" min="0" style="width:90px"> and <input type="number" id="p-max-followers" min="100" style="width:100px"></div>
+            <div class="form-row"><label for="p-ideal-followers">"Ideal" (ranks first) under</label><input type="number" id="p-ideal-followers" min="0" style="width:100px"></div>
+            <div class="form-row"><label for="p-min-posts">Posts between</label>
+              <input type="number" id="p-min-posts" min="0" style="width:90px"> and <input type="number" id="p-max-posts" min="1" style="width:100px"></div>
+            <div class="form-row"><label for="p-active-days">Posted within the last (days)</label><input type="number" id="p-active-days" min="7" max="365" style="width:90px"></div>
+            <div class="form-row"><label>Brands that make</label>
+              <label class="check"><input type="checkbox" class="p-segment" value="womenswear"> Womenswear</label>
+              <label class="check"><input type="checkbox" class="p-segment" value="kidswear"> Kidswear</label>
+              <label class="check"><input type="checkbox" class="p-segment" value="menswear"> Menswear</label></div>
+            <div class="form-row"><label for="p-ethnic">Also accept traditional ethnicwear-only brands</label><input type="checkbox" id="p-ethnic"></div>
+            <label class="setup-note">Anything else the AI fit check should know (plain words)
+              <textarea id="p-fit-notes" rows="2" placeholder="e.g. Prefer labels launched in the last 2 years; skip swimwear-only brands"></textarea></label>
+
+            <h3 class="setup-head">Search cost</h3>
+            <p class="sub" id="p-cost-line"></p>
+            <div class="form-row"><label for="p-results">Results per search<br><span class="muted" style="font-size:12px">Serper free plan allows at most 10</span></label><input type="number" id="p-results" min="1" max="100" style="width:80px"></div>
+            <div class="form-row"><label for="p-sites">Also search brand websites<br><span class="muted" style="font-size:12px">One extra search per place</span></label><input type="checkbox" id="p-sites" onchange="previewSize()"></div>
+            <div class="form-row"><label for="p-snowball">Find brands mentioned by known brands<br><span class="muted" style="font-size:12px">Uses Instagram calls, no search cost</span></label><input type="checkbox" id="p-snowball"></div>
+            <div class="form-row"><label for="p-budget">Monthly search limit<br><span class="muted" style="font-size:12px">Runs stop searching once it's used; 0 = no limit</span></label><input type="number" id="p-budget" min="0" style="width:100px"></div>
+            <div class="form-row"><label for="p-cost">Price per 1,000 searches (USD)<br><span class="muted" style="font-size:12px">From your search plan, for the estimates</span></label><input type="number" id="p-cost" min="0" step="0.1" style="width:90px" oninput="previewSize()"></div>
             <div class="row"><button class="btn primary" onclick="saveSetup()">Save setup</button>
               <span class="spacer"></span><select id="p-history"></select><button class="btn" onclick="restoreSetup()">Restore</button></div>
           </div>
