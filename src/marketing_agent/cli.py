@@ -231,7 +231,7 @@ def targets_list() -> None:
 def brands_run(
     country: Optional[str] = typer.Option(None, help="Country codes, e.g. us,in,gb (default: the app's search setup)"),
     per_country: Optional[int] = typer.Option(None, help="Brands per country (default: the search setup)"),
-    minutes: float = typer.Option(14, help="Time budget for the run"),
+    minutes: Optional[float] = typer.Option(None, help="Time budget for the run (default: the search setup's)"),
     email: bool = typer.Option(True, help="Email the list to DIGEST_EMAIL"),
     model: bool = typer.Option(True, help="Let the model judge fit and region (else keywords only)"),
 ) -> None:
@@ -248,9 +248,12 @@ def brands_run(
     if search is None:
         _log("[yellow]No BRAVE_SEARCH_API_KEY / SERPER_API_KEY: skipping web search sweeps.[/yellow]")
     llm = clients.llm(settings) if model and clients.llm_configured(settings) else None
+    config, _ = brands.current_config(settings, db)
+    for line in brands.describe(config, brands.search_usage(db, config)):
+        _log(line)
     run = brands.run_job(settings, db, ig=_instagram(settings), search=search, llm=llm,
                          gmail=_gmail(settings) if email else None, per_country=per_country, countries=countries,
-                         deadline=time.monotonic() + minutes * 60, log=_log)
+                         deadline=time.monotonic() + (minutes or config.minutes) * 60, log=_log)
     console.print(brands.render(run)[1], highlight=False)
 
 
@@ -282,10 +285,18 @@ def brands_seed(
 
     settings, db = _ctx()
     search = brands.search_client(settings)
+    config, config_id = brands.current_config(settings, db)
+    left = brands.search_usage(db, config)["budget_left"]          # None = no monthly limit
+    lookup_run = None
     added, unresolved = 0, []
     for handle, name in _seed_entries(path):
-        if not handle and search and name:
-            hits = search.search(f'site:instagram.com "{name}"', count=5)
+        if not handle and search and name and left != 0:
+            query = f'site:instagram.com "{name}"'
+            hits = search.search(query, count=5)
+            # Name lookups are billed searches too: record them so they count towards the monthly limit.
+            lookup_run = lookup_run or db.start_brand_search(config_id)
+            db.add_search_query(lookup_run, query, "lookup", "", len(hits), 0)
+            left = None if left is None else left - 1
             handle = next((h for h in (handle_from_instagram_url(r.url) for r in hits) if h), None)
         if not handle:
             unresolved.append(name)
@@ -294,10 +305,25 @@ def brands_seed(
             db.save_brand_candidate(handle, "known", name=name or None, reason=f"seed: {source or path.name}",
                                     sources="seed")
             added += 1
+    if lookup_run:
+        db.finish_brand_search(lookup_run, status="done", stopped="name lookups for `agent brands seed`")
+    if left == 0:
+        _log("[yellow]Monthly search limit reached: remaining names were not looked up.[/yellow]")
     _log(f"{added} brands added to the ledger.")
     if unresolved:
         hint = "" if search else " (set BRAVE_SEARCH_API_KEY or SERPER_API_KEY to look names up)"
         _log(f"[yellow]No Instagram handle for {len(unresolved)}{hint}:[/yellow] " + ", ".join(unresolved[:20]))
+
+
+@brands_app.command("usage")
+def brands_usage() -> None:
+    """Show web searches used this month and what they cost, with the current search rules."""
+    from . import brands
+
+    settings, db = _ctx()
+    config, _ = brands.current_config(settings, db)
+    for line in brands.describe(config, brands.search_usage(db, config)):
+        _log(line)
 
 
 @brands_app.command("list")

@@ -270,3 +270,32 @@ def test_usage_reports_searches_and_cost(prospecting):
     u = service.usage()
     assert u["month"] == u["today"] > 0 and u["month_cost"] == round(u["month"] * 0.005, 2)
     assert u["budget_left"] == 100 - u["month"]
+
+
+def test_cli_seed_counts_name_lookups_and_respects_the_monthly_limit(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from marketing_agent import brands, cli
+    from marketing_agent.db import Database
+
+    db_path = tmp_path / "agent.db"
+    monkeypatch.setenv("AGENT_DB_PATH", str(db_path))
+    monkeypatch.setenv("AGENT_DB_S3_URI", "")
+    db = Database(db_path)
+    db.save_search_config(SearchConfig(monthly_search_budget=2).model_dump_json(), note="t", created_by="user")
+    db.conn.close()
+    search = FakeSearch({'"Kora Studio"': [ig_result("korastudio")], '"Linen Days"': [ig_result("lindays")]})
+    monkeypatch.setattr(brands, "search_client", lambda settings: search)
+    names = tmp_path / "muse.md"
+    names.write_text("Kora Studio\nLinen Days\nThird Label\n@known.handle\n")
+
+    result = CliRunner().invoke(cli.app, ["brands", "seed", str(names)])
+    assert result.exit_code == 0, result.output
+    assert "3 brands added" in result.output and "Monthly search limit reached" in result.output
+    assert len(search.queries) == 2                       # the third name wasn't looked up
+    db = Database(db_path)
+    assert db.searches_since(finder.month_start()) == 2
+
+    usage = " ".join(CliRunner().invoke(cli.app, ["brands", "usage"]).output.split())   # ignore line wrapping
+    assert "this month 2 searches" in usage and "0 of 2 left" in usage
+    assert "followers 0-10,000" in usage and "womenswear" in usage

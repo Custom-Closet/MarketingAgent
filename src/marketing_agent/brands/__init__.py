@@ -6,12 +6,51 @@ from typing import Callable
 
 from ..config import Settings
 from ..db import Database
-from .finder import BrandRun, add_to_pipeline, find_brands, render, save_run_file
+from .finder import BrandRun, add_to_pipeline, find_brands, month_start, render, save_run_file
 
 
 def search_client(settings: Settings):
     from ..sources.web_search import build_search
     return build_search(brave_api_key=settings.brave_search_api_key, serper_api_key=settings.serper_api_key)
+
+
+def current_config(settings: Settings, db: Database):
+    """(search setup, its version id): the one saved in the app, else defaults from .env."""
+    from .config import SearchConfig
+    saved = db.search_configs(1)
+    if saved:
+        return SearchConfig.from_json(saved[0]["config_json"]), saved[0]["id"]
+    return SearchConfig(max_per_country=settings.brand_leads_per_region,
+                        leads_per_run=settings.brand_leads_per_region * 2,
+                        queries_per_run=settings.brand_search_queries, lookup_limit=settings.brand_lookup_limit), None
+
+
+def search_usage(db: Database, config) -> dict:
+    """Web searches used (what the search API bills for) and their cost at the setup's price."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    month = db.searches_since(month_start(now))
+    rate = config.cost_per_1000 / 1000
+    budget = config.monthly_search_budget
+    return {"month": month, "today": db.searches_since(now.replace(hour=0, minute=0, second=0, microsecond=0)),
+            "last_30_days": db.searches_since(now - timedelta(days=30)), "cost_per_1000": config.cost_per_1000,
+            "month_cost": round(month * rate, 2), "per_run": config.queries_per_run,
+            "per_run_cost": round(config.queries_per_run * rate, 2),
+            "budget": budget, "budget_left": max(0, budget - month) if budget else None}
+
+
+def describe(config, usage: dict) -> list[str]:
+    """What a run will look for and what it may cost, for the terminal."""
+    c = config.criteria
+    rules = (f"followers {c.min_followers:,}-{c.max_followers:,} (ideal under {c.ideal_followers:,}), "
+             f"posts {c.min_posts}-{c.max_posts}, posted in the last {c.active_within_days} days, "
+             f"{' / '.join(c.segments)}{', ethnicwear-only accepted' if c.allow_ethnic_only else ''}")
+    where = ", ".join(f"{t.country.upper()} ({len(t.places) or 'country name'})" for t in config.targets)
+    left = f", {usage['budget_left']:,} of {usage['budget']:,} left" if usage["budget"] else ""
+    return [f"Who qualifies: {rules}",
+            f"Where: {where}",
+            f"Cost: up to {config.queries_per_run} searches this run (~${usage['per_run_cost']:.2f}); "
+            f"this month {usage['month']:,} searches (~${usage['month_cost']:.2f}){left}"]
 
 
 def run_job(settings: Settings, db: Database, *, ig, deadline: float, gmail=None, search=None, llm=None,
@@ -21,13 +60,8 @@ def run_job(settings: Settings, db: Database, *, ig, deadline: float, gmail=None
 
     Uses the search setup saved in the app (Marketing > Prospecting) and records the run there.
     """
-    from .config import SearchConfig
-    saved = db.search_configs(1)
-    config = (SearchConfig.from_json(saved[0]["config_json"]) if saved else
-              SearchConfig(max_per_country=settings.brand_leads_per_region,
-                           leads_per_run=settings.brand_leads_per_region * 2,
-                           queries_per_run=settings.brand_search_queries, lookup_limit=settings.brand_lookup_limit))
-    search_id = db.start_brand_search(saved[0]["id"] if saved else None)
+    config, config_id = current_config(settings, db)
+    search_id = db.start_brand_search(config_id)
     try:
         run = find_brands(db, ig=ig, search=search, llm=llm, countries=countries,
                           max_per_country=per_country or config.max_per_country,
